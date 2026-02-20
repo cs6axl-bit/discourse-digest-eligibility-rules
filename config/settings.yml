@@ -1,0 +1,59 @@
+plugins:
+  # ==========================================
+  # GLOBAL SWITCHES
+  # ==========================================
+  digest_eligibility_rules_enabled:
+    default: true
+    client: true
+
+  digest_eligibility_rules_debug:
+    default: false
+    client: false
+
+  # ==========================================
+  # PG ALLOWLIST (public schema)
+  # ==========================================
+  digest_eligibility_pg_allowlist_table:
+    default: ""
+    client: false
+
+  digest_eligibility_pg_allowlist_column:
+    default: "email"
+    client: false
+
+  digest_eligibility_pg_allowlist_cache_enabled:
+    default: true
+    client: false
+
+  digest_eligibility_pg_allowlist_cache_ttl_seconds:
+    default: 900
+    client: false
+
+  # ==========================================
+  # RULES JSON
+  # Eligible groups: OR between groups, AND within a group.
+  # Exclude groups: OR between groups, AND within a group. (hard block)
+  # ==========================================
+  digest_eligibility_rules_groups_json:
+    default: |
+      [
+        {
+          "name": "Example: Gmail + must watch cat 10 + allowlisted email",
+          "email_domain_in": ["gmail.com"],
+          "requires_watched_category_ids_any": [10],
+          "requires_email_in_pg_table": true
+        }
+      ]
+    textarea: true
+    client: false
+
+  digest_eligibility_rules_excludes_json:
+    default: |
+      [
+        {
+          "name": "Block Yahoo",
+          "email_domain_in": ["yahoo.com"]
+        }
+      ]
+    textarea: true
+    client: false
