@@ -1,59 +1,47 @@
 plugins:
-  # ==========================================
-  # GLOBAL SWITCHES
-  # ==========================================
   digest_eligibility_rules_enabled:
-    default: true
-    client: true
+    default: false
+    client: false
 
   digest_eligibility_rules_debug:
     default: false
     client: false
 
-  # ==========================================
-  # PG ALLOWLIST (public schema)
-  # ==========================================
-  digest_eligibility_pg_allowlist_table:
-    default: ""
-    client: false
-
-  digest_eligibility_pg_allowlist_column:
-    default: "email"
-    client: false
-
-  digest_eligibility_pg_allowlist_cache_enabled:
+  digest_eligibility_rules_apply_includes:
     default: true
     client: false
 
-  digest_eligibility_pg_allowlist_cache_ttl_seconds:
-    default: 900
+  digest_eligibility_rules_apply_excludes:
+    default: true
     client: false
 
-  # ==========================================
-  # RULES JSON
-  # Eligible groups: OR between groups, AND within a group.
-  # Exclude groups: OR between groups, AND within a group. (hard block)
-  # ==========================================
   digest_eligibility_rules_groups_json:
-    default: |
-      [
-        {
-          "name": "Example: Gmail + must watch cat 10 + allowlisted email",
-          "email_domain_in": ["gmail.com"],
-          "requires_watched_category_ids_any": [10],
-          "requires_email_in_pg_table": true
-        }
-      ]
-    textarea: true
+    default: "[]"
+    type: text
     client: false
 
   digest_eligibility_rules_excludes_json:
-    default: |
-      [
-        {
-          "name": "Block Yahoo",
-          "email_domain_in": ["yahoo.com"]
-        }
-      ]
-    textarea: true
+    default: "[]"
+    type: text
+    client: false
+
+  digest_eligibility_pg_emails_list_cache_enabled:
+    default: true
+    client: false
+
+  digest_eligibility_pg_emails_list_cache_ttl_seconds:
+    default: 900
+    client: false
+
+  digest_eligibility_pg_emails_list_page_size:
+    default: 50000
+    client: false
+
+  digest_eligibility_pg_emails_list_max_rows:
+    default: 0
+    client: false
+
+  digest_eligibility_pg_emails_lists_json:
+    default: "[]"
+    type: text
     client: false
