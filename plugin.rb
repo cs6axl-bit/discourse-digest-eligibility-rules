@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 # name: discourse-digest-eligibility-rules
-# about: Configurable eligibility + exclusion condition-groups (OR of AND rules) to decide who receives digest emails, incl. PG allowlist checks + caching.
-# version: 1.3.0
+# about: Configurable eligibility + exclusion condition-groups (OR of AND rules) to decide who receives digest emails, incl. PG emails_list checks + optional L1/L2 caching.
+# version: 2.2.1
 # authors: you
 # required_version: 3.0.0
 
@@ -12,7 +12,6 @@ after_initialize do
   require "json"
   require "time"
   require "set"
-  require "digest"
 
   module ::DigestEligibilityRules
     PLUGIN_NAME = "discourse-digest-eligibility-rules"
@@ -42,8 +41,6 @@ after_initialize do
 
     # --------------------------------
     # GLOBAL OFF SWITCH
-    # - UI: digest_eligibility_rules_enabled
-    # - ENV: DIGEST_ELIGIBILITY_GLOBAL_OFF=1 (hard off)
     # --------------------------------
     def self.globally_off?
       v = ENV["DIGEST_ELIGIBILITY_GLOBAL_OFF"].to_s.strip
@@ -60,8 +57,22 @@ after_initialize do
     end
 
     # --------------------------------
-    # Plugin-tracked digest stats
-    # (enqueue-time tracking: count + last_digest_at_utc)
+    # Switches for enabling include/exclude logic
+    # --------------------------------
+    def self.apply_includes?
+      SiteSetting.digest_eligibility_rules_apply_includes
+    rescue
+      true
+    end
+
+    def self.apply_excludes?
+      SiteSetting.digest_eligibility_rules_apply_excludes
+    rescue
+      true
+    end
+
+    # --------------------------------
+    # Stats
     # --------------------------------
     def self.stats_key(user_id)
       "#{STORE_KEY_PREFIX}#{user_id}"
@@ -105,9 +116,7 @@ after_initialize do
         data = {}
       end
 
-      cnt = (data["digest_count"].to_i rescue 0)
-      cnt += 1
-
+      cnt = (data["digest_count"].to_i rescue 0) + 1
       data["digest_count"] = cnt
       data["last_digest_at_utc"] = now_utc.utc.iso8601
 
@@ -164,6 +173,12 @@ after_initialize do
       nil
     end
 
+    def self.safe_int(v, default = 0)
+      Integer(v)
+    rescue
+      default
+    end
+
     # --------------------------------
     # Watched category map (bulk)
     # user_id => Set(category_id) for watched levels
@@ -186,165 +201,321 @@ after_initialize do
     end
 
     # --------------------------------
-    # PG allowlist cache (in-process, TTL)
-    # same style as your @domain_metrics_cache
+    # Watched min-count
+    # group["requires_watched_category_ids_min_count"] = {"category_ids":[...], "min_count":3}
     # --------------------------------
-    def self.pg_allowlist_cache
-      @pg_allowlist_cache ||= {}
-    end
+    def self.check_watched_min_count!(group, watched_set)
+      obj = group["requires_watched_category_ids_min_count"]
+      return true unless obj.is_a?(Hash)
 
-    def self.pg_allowlist_cache_enabled?
-      SiteSetting.digest_eligibility_pg_allowlist_cache_enabled
+      ids = obj["category_ids"]
+      min = obj["min_count"]
+      return false unless ids.is_a?(Array)
+
+      want = ids.map(&:to_i).uniq
+      minc = safe_int(min, 0)
+      minc = 0 if minc < 0
+
+      return true if want.empty? || minc <= 0
+      return false if watched_set.nil?
+
+      cnt = 0
+      want.each do |cid|
+        if watched_set.include?(cid)
+          cnt += 1
+          return true if cnt >= minc
+        end
+      end
+      false
     rescue
       false
     end
 
-    def self.pg_allowlist_cache_ttl
-      v = (SiteSetting.digest_eligibility_pg_allowlist_cache_ttl_seconds || 900).to_i
+    # --------------------------------
+    # emails_list caching controls
+    # --------------------------------
+    def self.l1_enabled?
+      SiteSetting.digest_eligibility_emails_list_l1_cache_enabled
+    rescue
+      true
+    end
+
+    def self.l2_enabled?
+      SiteSetting.digest_eligibility_emails_list_l2_cache_enabled
+    rescue
+      true
+    end
+
+    def self.emails_list_cache_ttl_seconds
+      v = (SiteSetting.digest_eligibility_emails_list_cache_ttl_seconds || 900).to_i
       v = 0 if v < 0
       v
     rescue
       900
     end
 
-    def self.default_pg_table
-      SiteSetting.digest_eligibility_pg_allowlist_table.to_s.strip
+    def self.emails_list_cache_ttl_jitter_seconds
+      v = (SiteSetting.digest_eligibility_emails_list_cache_ttl_jitter_seconds || 0).to_i
+      v = 0 if v < 0
+      v
     rescue
-      ""
+      0
     end
 
-    def self.default_pg_column
-      c = SiteSetting.digest_eligibility_pg_allowlist_column.to_s.strip
-      c = "email" if c.blank?
-      c
+    def self.emails_list_page_size
+      v = (SiteSetting.digest_eligibility_emails_list_page_size || 50_000).to_i
+      v = 50_000 if v <= 0
+      v
     rescue
-      "email"
+      50_000
     end
 
-    # Collect all (table,column) pairs referenced by groups that use requires_email_in_pg_table
-    def self.collect_pg_allowlist_pairs(groups)
-      pairs = []
-      groups.each do |g|
-        next unless g.is_a?(Hash)
-        next unless g["requires_email_in_pg_table"] == true
+    def self.emails_list_max_rows
+      v = (SiteSetting.digest_eligibility_emails_list_max_rows || 0).to_i
+      v = 0 if v < 0
+      v
+    rescue
+      0
+    end
 
-        t = g["pg_table"].to_s.strip
-        c = g["pg_column"].to_s.strip
-        t = default_pg_table if t.blank?
-        c = default_pg_column if c.blank?
+    def self.discourse_cache_prefix
+      p = SiteSetting.digest_eligibility_emails_list_cache_prefix.to_s.strip
+      p = "der:emails_list:v1" if p.blank?
+      p
+    rescue
+      "der:emails_list:v1"
+    end
 
-        pairs << [t, c] if t.present? && c.present?
+    def self.l2_cache_key(table_name, column_name)
+      "#{discourse_cache_prefix}:public.#{table_name}.#{column_name}"
+    end
+
+    def self.l1_cache_key(table_name, column_name)
+      "public.#{table_name}.#{column_name}"
+    end
+
+    def self.l1_cache
+      @l1_cache ||= {}
+    end
+
+    def self.effective_ttl_seconds
+      ttl = emails_list_cache_ttl_seconds.to_i
+      return 0 if ttl <= 0
+      j = emails_list_cache_ttl_jitter_seconds.to_i
+      j = 0 if j < 0
+      ttl + (j > 0 ? rand(0..j) : 0)
+    rescue
+      emails_list_cache_ttl_seconds.to_i
+    end
+
+    # --------------------------------
+    # emails_list config (UNLIMITED)
+    # SiteSetting.digest_eligibility_emails_lists_json:
+    # [
+    #   {"name":"A","table":"emails_list_a","column":"email"},
+    #   {"name":"B","table":"emails_list_b","column":"email"}
+    # ]
+    # --------------------------------
+    def self.load_emails_lists_config
+      raw = SiteSetting.digest_eligibility_emails_lists_json.to_s.strip
+      return {} if raw.blank?
+
+      parsed = JSON.parse(raw)
+      return {} unless parsed.is_a?(Array)
+
+      out = {}
+      parsed.each do |row|
+        next unless row.is_a?(Hash)
+
+        name = row["name"].to_s.strip
+        t    = row["table"].to_s.strip
+        c    = row["column"].to_s.strip
+        c = "email" if c.blank?
+
+        next unless valid_ident?(name) && valid_ident?(t) && valid_ident?(c)
+        out[name] = { table: t, column: c } # duplicate names => last wins
       end
-      pairs.uniq
+      out
+    rescue => e
+      warn("ERROR parsing digest_eligibility_emails_lists_json: #{e.class}: #{e.message}")
+      {}
     end
 
-    # Fetch which of the provided emails exist in public.<table>.<column>.
-    # Uses ::DB.query with IN (?, ?, ...) style binds (same pattern as your router),
-    # chunked to avoid huge placeholder lists.
-    def self.fetch_allowlisted_emails_from_pg(emails, table_name, column_name)
-      emails_norm = Array(emails).map { |e| normalize_email(e) }.reject(&:blank?).uniq
-      return Set.new if emails_norm.empty?
-
+    # --------------------------------
+    # DB load: fetch ALL emails from public.<table>.<column>
+    # returns Array (lowercased, uniq)
+    # --------------------------------
+    def self.load_all_emails_array_from_pg(table_name, column_name)
       t = table_name.to_s.strip
       c = column_name.to_s.strip
       c = "email" if c.blank?
-
-      unless valid_ident?(t) && valid_ident?(c)
-        warn("allowlist invalid identifiers table=#{t.inspect} col=#{c.inspect} (must match #{IDENT_RE})")
-        return Set.new
-      end
-
-      ttl = pg_allowlist_cache_ttl
-      now = Time.now.to_i
-      cache_key = nil
-
-      if pg_allowlist_cache_enabled? && ttl > 0
-        hash = Digest::SHA256.hexdigest(emails_norm.sort.join("\n"))
-        cache_key = "public.#{t}.#{c}:#{hash}"
-
-        cached = pg_allowlist_cache[cache_key]
-        if cached && cached[:expires_at].to_i > now
-          arr = cached[:emails] || []
-          return Set.new(arr.map { |x| x.to_s.strip.downcase }.reject(&:blank?))
-        end
-      end
 
       table_ref = %Q{"public"."#{t}"}
       col_ref   = %Q{"#{c}"}
 
       out = []
+      offset = 0
+      psize = emails_list_page_size
+      mrows = emails_list_max_rows
 
-      begin
-        chunk_size = 500
-        emails_norm.each_slice(chunk_size) do |chunk|
-          placeholders = (["?"] * chunk.length).join(",")
-          sql = <<~SQL
-            SELECT lower(#{col_ref}) AS email
-            FROM #{table_ref}
-            WHERE lower(#{col_ref}) IN (#{placeholders})
-          SQL
+      loop do
+        sql = <<~SQL
+          SELECT lower(#{col_ref}) AS email
+          FROM #{table_ref}
+          ORDER BY lower(#{col_ref})
+          LIMIT #{psize} OFFSET #{offset}
+        SQL
 
-          res = ::DB.query(sql, *chunk)
+        res = ::DB.query(sql)
 
-          ary =
-            if res.is_a?(Array)
-              res
-            elsif res.respond_to?(:to_a)
-              tmp = res.to_a
-              tmp.is_a?(Array) ? tmp : []
-            else
-              []
-            end
-
-          ary.each do |r|
-            v =
-              if r.respond_to?(:[])
-                (r[:email] rescue nil) || (r["email"] rescue nil)
-              elsif r.respond_to?(:email)
-                (r.email rescue nil)
-              end
-
-            s = v.to_s.strip.downcase
-            out << s unless s.empty?
+        ary =
+          if res.is_a?(Array)
+            res
+          elsif res.respond_to?(:to_a)
+            tmp = res.to_a
+            tmp.is_a?(Array) ? tmp : []
+          else
+            []
           end
+
+        break if ary.empty?
+
+        ary.each do |r|
+          v =
+            if r.respond_to?(:[])
+              (r[:email] rescue nil) || (r["email"] rescue nil)
+            elsif r.respond_to?(:email)
+              (r.email rescue nil)
+            end
+          s = v.to_s.strip.downcase
+          out << s unless s.empty?
         end
-      rescue => e
-        warn("allowlist query failed table=public.#{t} col=#{c}: #{e.class}: #{e.message}")
-        out = []
+
+        offset += psize
+        break if mrows > 0 && out.length >= mrows
       end
 
       out.uniq!
-      set = Set.new(out)
-
-      if cache_key && pg_allowlist_cache_enabled? && ttl > 0
-        pg_allowlist_cache[cache_key] = { expires_at: now + ttl, emails: out }
-        debug("allowlist cache store key=#{cache_key} hits=#{out.length} ttl=#{ttl}s")
-      end
-
-      set
+      out = out.take(mrows) if mrows > 0 && out.length > mrows
+      out
+    rescue => e
+      warn("emails_list query failed table=public.#{table_name} col=#{column_name}: #{e.class}: #{e.message}")
+      []
     end
 
-    # Precompute allowlist sets for each referenced (table,col) pair
-    # returns { "table|col" => Set(allowed_emails) }
-    def self.precompute_pg_allowlists_for_emails(groups, all_emails)
-      out = {}
-      pairs = collect_pg_allowlist_pairs(groups)
-      return out if pairs.blank?
+    # --------------------------------
+    # Fetch ALL emails with caching:
+    # - L1 in-process (optional)
+    # - L2 Discourse.cache (cross-process) (optional)
+    # returns Set
+    # --------------------------------
+    def self.fetch_all_emails_from_pg_list(table_name, column_name)
+      t = table_name.to_s.strip
+      c = column_name.to_s.strip
+      c = "email" if c.blank?
 
-      pairs.each do |t, c|
-        key = "#{t}|#{c}"
-        out[key] = fetch_allowlisted_emails_from_pg(all_emails, t, c)
-        debug("pg_allowlist precomputed key=#{key} hits=#{out[key].length}")
+      unless valid_ident?(t) && valid_ident?(c)
+        warn("emails_list invalid identifiers table=#{t.inspect} col=#{c.inspect} (must match #{IDENT_RE})")
+        return Set.new
+      end
+
+      ttl = effective_ttl_seconds
+      now = Time.now.to_i
+
+      # L1
+      l1k = l1_cache_key(t, c)
+      if l1_enabled? && ttl > 0
+        cached = l1_cache[l1k]
+        if cached && cached[:expires_at].to_i > now
+          return Set.new(cached[:emails] || [])
+        end
+      end
+
+      # L2
+      arr = nil
+      if l2_enabled? && ttl > 0
+        l2k = l2_cache_key(t, c)
+        begin
+          arr =
+            Discourse.cache.fetch(l2k, expires_in: ttl.seconds) do
+              debug("emails_list L2 MISS key=#{l2k} => loading from PG public.#{t}.#{c}")
+              load_all_emails_array_from_pg(t, c)
+            end
+
+          arr = [] unless arr.is_a?(Array)
+          arr = arr.map { |x| x.to_s.strip.downcase }.reject(&:blank?).uniq
+          debug("emails_list L2 HIT key=#{l2k} rows=#{arr.length}") if debug_enabled?
+        rescue => e
+          debug("emails_list L2 fetch failed key=#{l2k}: #{e.class}: #{e.message}")
+          arr = nil
+        end
+      end
+
+      arr ||= load_all_emails_array_from_pg(t, c)
+
+      # store L1
+      if l1_enabled? && ttl > 0
+        l1_cache[l1k] = { expires_at: now + ttl, emails: arr }
+      end
+
+      Set.new(arr)
+    end
+
+    # --------------------------------
+    # Collect emails_list names referenced by groups (including nested exclude)
+    # --------------------------------
+    def self.collect_emails_list_names_from_group(g, out)
+      return unless g.is_a?(Hash)
+
+      %w[
+        requires_email_in_emails_lists_any
+        requires_email_in_emails_lists_all
+        requires_email_not_in_emails_lists_any
+      ].each do |k|
+        next unless g[k].is_a?(Array)
+        g[k].each do |name|
+          s = name.to_s.strip
+          out << s unless s.blank?
+        end
+      end
+
+      collect_emails_list_names_from_group(g["exclude"], out) if g["exclude"].is_a?(Hash)
+    end
+
+    def self.collect_emails_list_names(groups)
+      out = []
+      Array(groups).each { |g| collect_emails_list_names_from_group(g, out) }
+      out.map(&:to_s).map(&:strip).reject(&:blank?).uniq
+    end
+
+    def self.precompute_emails_lists_by_name(referenced_names, config_map)
+      out = {}
+      names = Array(referenced_names).map { |x| x.to_s.strip }.reject(&:blank?).uniq
+      return out if names.empty?
+
+      names.each do |name|
+        cfg = config_map[name]
+        if !cfg || cfg[:table].blank? || cfg[:column].blank?
+          out[name] = nil
+          debug("emails_list precompute name=#{name} MISSING/INVALID config")
+          next
+        end
+
+        out[name] = fetch_all_emails_from_pg_list(cfg[:table], cfg[:column])
+        debug("emails_list loaded name=#{name} table=public.#{cfg[:table]} col=#{cfg[:column]} rows=#{out[name].length}")
       end
 
       out
     end
 
+    def self.group_references_missing_emails_list?(names, lists_by_name)
+      names.any? { |n| !lists_by_name.key?(n) || lists_by_name[n].nil? }
+    end
+
     # --------------------------------
     # Group evaluation
     # --------------------------------
-    def self.user_matches_group?(group, user_id:, email_domain:, watched_set:, stats:, now_utc:, email_norm:, pg_allowlists:)
-      # Optional per-group exclude (AND block)
+    def self.user_matches_group?(group, user_id:, email_domain:, watched_set:, stats:, now_utc:, email_norm:, emails_lists_by_name:)
       if group["exclude"].is_a?(Hash)
         if user_matches_group?(group["exclude"],
                                user_id: user_id,
@@ -353,12 +524,11 @@ after_initialize do
                                stats: stats,
                                now_utc: now_utc,
                                email_norm: email_norm,
-                               pg_allowlists: pg_allowlists)
+                               emails_lists_by_name: emails_lists_by_name)
           return false
         end
       end
 
-      # Email domain allow/deny
       if group["email_domain_in"].is_a?(Array)
         allowed = group["email_domain_in"].map { |x| x.to_s.downcase.strip }.reject(&:blank?).uniq
         return false if allowed.present? && !allowed.include?(email_domain)
@@ -369,7 +539,6 @@ after_initialize do
         return false if blocked.present? && blocked.include?(email_domain)
       end
 
-      # Watched categories (any/all)
       if group["requires_watched_category_ids_any"].is_a?(Array)
         req = group["requires_watched_category_ids_any"].map(&:to_i).uniq
         return false if req.present? && (watched_set.nil? || (watched_set & req).empty?)
@@ -383,7 +552,8 @@ after_initialize do
         end
       end
 
-      # Plugin-tracked digest constraints
+      return false unless check_watched_min_count!(group, watched_set)
+
       digest_count = stats["digest_count"].to_i rescue 0
       last_at = parse_time_utc(stats["last_digest_at_utc"])
 
@@ -407,20 +577,30 @@ after_initialize do
         return false if days > maxd
       end
 
-      # NEW: requires email in PG allowlist table
-      if group["requires_email_in_pg_table"] == true
-        t = group["pg_table"].to_s.strip
-        c = group["pg_column"].to_s.strip
-        t = default_pg_table if t.blank?
-        c = default_pg_column if c.blank?
+      if group["requires_email_in_emails_lists_any"].is_a?(Array)
+        names = group["requires_email_in_emails_lists_any"].map { |x| x.to_s.strip }.reject(&:blank?).uniq
+        if names.present?
+          return false if group_references_missing_emails_list?(names, emails_lists_by_name)
+          ok = names.any? { |n| emails_lists_by_name[n].include?(email_norm) }
+          return false unless ok
+        end
+      end
 
-        # Misconfigured => fail closed
-        return false if t.blank? || c.blank?
+      if group["requires_email_in_emails_lists_all"].is_a?(Array)
+        names = group["requires_email_in_emails_lists_all"].map { |x| x.to_s.strip }.reject(&:blank?).uniq
+        if names.present?
+          return false if group_references_missing_emails_list?(names, emails_lists_by_name)
+          names.each { |n| return false unless emails_lists_by_name[n].include?(email_norm) }
+        end
+      end
 
-        key = "#{t}|#{c}"
-        set = pg_allowlists[key]
-        return false unless set.is_a?(Set)
-        return false unless set.include?(email_norm)
+      if group["requires_email_not_in_emails_lists_any"].is_a?(Array)
+        names = group["requires_email_not_in_emails_lists_any"].map { |x| x.to_s.strip }.reject(&:blank?).uniq
+        if names.present?
+          return false if group_references_missing_emails_list?(names, emails_lists_by_name)
+          blocked = names.any? { |n| emails_lists_by_name[n].include?(email_norm) }
+          return false if blocked
+        end
       end
 
       true
@@ -436,23 +616,22 @@ after_initialize do
 
     # --------------------------------
     # Main filter
-    # 1) hard excludes
-    # 2) must match at least one eligible group
     # --------------------------------
     def self.filter_ids_by_rules(base_user_ids)
       return base_user_ids if base_user_ids.blank?
 
       eligible_groups = load_eligible_groups
       exclude_groups  = load_exclude_groups
+      now_utc = Time.now.utc
 
-      if eligible_groups.blank?
-        debug("No eligible groups configured => filtering out all users")
+      apply_inc = apply_includes?
+      apply_exc = apply_excludes?
+
+      if apply_inc && eligible_groups.blank?
+        debug("No eligible groups configured AND apply_includes=true => filtering out all users")
         return []
       end
 
-      now_utc = Time.now.utc
-
-      # Bulk primary emails
       email_rows =
         UserEmail
           .where(user_id: base_user_ids, primary: true)
@@ -461,30 +640,40 @@ after_initialize do
       email_map = {}
       email_rows.each { |uid, em| email_map[uid] = em }
 
-      all_emails = email_map.values.compact
+      groups_for_ref =
+        []
+          .tap { |arr| arr.concat(eligible_groups) if apply_inc }
+          .tap { |arr| arr.concat(exclude_groups)  if apply_exc }
 
-      # Precompute PG allowlists for all referenced pairs (eligible + excludes + nested excludes not supported for allowlist in this minimal version)
-      pg_allowlists = precompute_pg_allowlists_for_emails(eligible_groups + exclude_groups, all_emails)
+      emails_lists_config   = load_emails_lists_config
+      referenced_list_names = collect_emails_list_names(groups_for_ref)
+      emails_lists_by_name  = precompute_emails_lists_by_name(referenced_list_names, emails_lists_config)
 
-      # Collect all category IDs referenced
+      # Collect category IDs referenced (any/all/min_count), including nested exclude
       all_cat_ids = []
-      [eligible_groups, exclude_groups].each do |groups|
-        groups.each do |g|
-          next unless g.is_a?(Hash)
-          if g["requires_watched_category_ids_any"].is_a?(Array)
-            all_cat_ids.concat(g["requires_watched_category_ids_any"].map(&:to_i))
+      groups_for_ref.each do |g|
+        next unless g.is_a?(Hash)
+
+        if g["requires_watched_category_ids_any"].is_a?(Array)
+          all_cat_ids.concat(g["requires_watched_category_ids_any"].map(&:to_i))
+        end
+        if g["requires_watched_category_ids_all"].is_a?(Array)
+          all_cat_ids.concat(g["requires_watched_category_ids_all"].map(&:to_i))
+        end
+        if g["requires_watched_category_ids_min_count"].is_a?(Hash) && g["requires_watched_category_ids_min_count"]["category_ids"].is_a?(Array)
+          all_cat_ids.concat(g["requires_watched_category_ids_min_count"]["category_ids"].map(&:to_i))
+        end
+
+        if g["exclude"].is_a?(Hash)
+          ex = g["exclude"]
+          if ex["requires_watched_category_ids_any"].is_a?(Array)
+            all_cat_ids.concat(ex["requires_watched_category_ids_any"].map(&:to_i))
           end
-          if g["requires_watched_category_ids_all"].is_a?(Array)
-            all_cat_ids.concat(g["requires_watched_category_ids_all"].map(&:to_i))
+          if ex["requires_watched_category_ids_all"].is_a?(Array)
+            all_cat_ids.concat(ex["requires_watched_category_ids_all"].map(&:to_i))
           end
-          if g["exclude"].is_a?(Hash)
-            ex = g["exclude"]
-            if ex["requires_watched_category_ids_any"].is_a?(Array)
-              all_cat_ids.concat(ex["requires_watched_category_ids_any"].map(&:to_i))
-            end
-            if ex["requires_watched_category_ids_all"].is_a?(Array)
-              all_cat_ids.concat(ex["requires_watched_category_ids_all"].map(&:to_i))
-            end
+          if ex["requires_watched_category_ids_min_count"].is_a?(Hash) && ex["requires_watched_category_ids_min_count"]["category_ids"].is_a?(Array)
+            all_cat_ids.concat(ex["requires_watched_category_ids_min_count"]["category_ids"].map(&:to_i))
           end
         end
       end
@@ -510,33 +699,29 @@ after_initialize do
           stats: stats,
           now_utc: now_utc,
           email_norm: email_norm,
-          pg_allowlists: pg_allowlists
+          emails_lists_by_name: emails_lists_by_name
         }
 
-        # 1) excludes (hard block)
-        if exclude_groups.present? && user_matches_any_group?(exclude_groups, **args)
+        if apply_exc && exclude_groups.present? && user_matches_any_group?(exclude_groups, **args)
           next
         end
 
-        # 2) eligible groups (must match at least one)
-        if user_matches_any_group?(eligible_groups, **args)
+        if apply_inc
+          kept << uid if user_matches_any_group?(eligible_groups, **args)
+        else
           kept << uid
         end
       end
 
-      debug("filter_ids_by_rules base=#{base_user_ids.length} kept=#{kept.length} eligible_groups=#{eligible_groups.length} exclude_groups=#{exclude_groups.length}")
+      debug("filter_ids_by_rules base=#{base_user_ids.length} kept=#{kept.length} apply_includes=#{apply_inc} apply_excludes=#{apply_exc} eligible_groups=#{eligible_groups.length} exclude_groups=#{exclude_groups.length}")
       kept
     end
   end
 
-  # Announce hard-off at boot
   if ::DigestEligibilityRules.globally_off?
     ::DigestEligibilityRules.warn("GLOBAL OFF: DIGEST_ELIGIBILITY_GLOBAL_OFF is set; plugin will not filter digests")
   end
 
-  # --------------------------------
-  # Patch the digest enqueue job
-  # --------------------------------
   module ::DigestEligibilityRules
     module EnqueueDigestEmailsPatch
       def target_user_ids
