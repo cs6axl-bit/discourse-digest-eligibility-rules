@@ -25,23 +25,44 @@ plugins:
     type: text
     client: false
 
-  digest_eligibility_pg_emails_list_cache_enabled:
+  # emails_list sources (UNLIMITED)
+  # [
+  #   {"name":"A","table":"emails_list_a","column":"email"},
+  #   {"name":"B","table":"emails_list_b","column":"email"}
+  # ]
+  digest_eligibility_emails_lists_json:
+    default: "[]"
+    type: text
+    client: false
+
+  # emails_list caching
+  digest_eligibility_emails_list_l1_cache_enabled:
     default: true
     client: false
 
-  digest_eligibility_pg_emails_list_cache_ttl_seconds:
+  digest_eligibility_emails_list_l2_cache_enabled:
+    default: true
+    client: false
+
+  digest_eligibility_emails_list_cache_ttl_seconds:
     default: 900
     client: false
 
-  digest_eligibility_pg_emails_list_page_size:
+  # Optional jitter to reduce stampede when TTL expires (0 disables)
+  digest_eligibility_emails_list_cache_ttl_jitter_seconds:
+    default: 30
+    client: false
+
+  # DB paging + safety cap
+  digest_eligibility_emails_list_page_size:
     default: 50000
     client: false
 
-  digest_eligibility_pg_emails_list_max_rows:
+  digest_eligibility_emails_list_max_rows:
     default: 0
     client: false
 
-  digest_eligibility_pg_emails_lists_json:
-    default: "[]"
-    type: text
+  # Shared cache key prefix (bump to hard-bust caches)
+  digest_eligibility_emails_list_cache_prefix:
+    default: "der:emails_list:v1"
     client: false
