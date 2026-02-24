@@ -1,10 +1,15 @@
 # frozen_string_literal: true
-
+#
 # name: discourse-digest-eligibility-rules
 # about: Configurable eligibility + exclusion condition-groups (OR of AND rules) to decide who receives digest emails, incl. PG emails_list checks + optional L1/L2 caching.
-# version: 2.2.1
+# version: 2.3.0
 # authors: you
 # required_version: 3.0.0
+#
+# v2.3.0:
+# - Adds "reason counters" summary logs (no per-user spam)
+# - Counts why users were excluded / not included / missing config, etc.
+#
 
 enabled_site_setting :digest_eligibility_rules_enabled
 
@@ -177,6 +182,32 @@ after_initialize do
       Integer(v)
     rescue
       default
+    end
+
+    # --------------------------------
+    # Reason counters
+    # --------------------------------
+    def self.rc_inc!(rc, key, n = 1)
+      return if rc.nil?
+      rc[key] = (rc[key].to_i + n.to_i)
+    rescue
+      # ignore
+    end
+
+    def self.rc_merge_missing!(rc, miss_hash)
+      return if rc.nil? || miss_hash.nil?
+      miss_hash.each { |k, v| rc_inc!(rc, :"missing_emails_list:#{k}", v.to_i) }
+    rescue
+      # ignore
+    end
+
+    def self.rc_summary_string(rc)
+      return "" if rc.nil? || rc.empty?
+      # Sort by count desc then key
+      pairs = rc.sort_by { |k, v| [-v.to_i, k.to_s] }
+      pairs.map { |k, v| "#{k}=#{v}" }.join(" ")
+    rescue
+      ""
     end
 
     # --------------------------------
@@ -512,10 +543,32 @@ after_initialize do
       names.any? { |n| !lists_by_name.key?(n) || lists_by_name[n].nil? }
     end
 
+    # For counters: returns { "NAME" => count_missing_refs_in_groups, ... }
+    def self.find_missing_emails_list_refs_in_groups(groups, emails_lists_by_name)
+      out = Hash.new(0)
+      Array(groups).each do |g|
+        next unless g.is_a?(Hash)
+        names = []
+        collect_emails_list_names_from_group(g, names)
+        names.each do |n|
+          s = n.to_s.strip
+          next if s.blank?
+          if !emails_lists_by_name.key?(s) || emails_lists_by_name[s].nil?
+            out[s] += 1
+          end
+        end
+      end
+      out
+    rescue
+      {}
+    end
+
     # --------------------------------
     # Group evaluation
+    # Adds optional reason counters (rc)
     # --------------------------------
-    def self.user_matches_group?(group, user_id:, email_domain:, watched_set:, stats:, now_utc:, email_norm:, emails_lists_by_name:)
+    def self.user_matches_group?(group, user_id:, email_domain:, watched_set:, stats:, now_utc:, email_norm:, emails_lists_by_name:, rc: nil, context: nil)
+      # Nested exclude inside this group
       if group["exclude"].is_a?(Hash)
         if user_matches_group?(group["exclude"],
                                user_id: user_id,
@@ -524,92 +577,150 @@ after_initialize do
                                stats: stats,
                                now_utc: now_utc,
                                email_norm: email_norm,
-                               emails_lists_by_name: emails_lists_by_name)
+                               emails_lists_by_name: emails_lists_by_name,
+                               rc: rc,
+                               context: "nested_exclude")
+          rc_inc!(rc, :"#{context || 'group'}:blocked_by_nested_exclude")
           return false
         end
       end
 
       if group["email_domain_in"].is_a?(Array)
         allowed = group["email_domain_in"].map { |x| x.to_s.downcase.strip }.reject(&:blank?).uniq
-        return false if allowed.present? && !allowed.include?(email_domain)
+        if allowed.present? && !allowed.include?(email_domain)
+          rc_inc!(rc, :"#{context || 'group'}:domain_not_allowed")
+          return false
+        end
       end
 
       if group["email_domain_not_in"].is_a?(Array)
         blocked = group["email_domain_not_in"].map { |x| x.to_s.downcase.strip }.reject(&:blank?).uniq
-        return false if blocked.present? && blocked.include?(email_domain)
+        if blocked.present? && blocked.include?(email_domain)
+          rc_inc!(rc, :"#{context || 'group'}:domain_blocked")
+          return false
+        end
       end
 
       if group["requires_watched_category_ids_any"].is_a?(Array)
         req = group["requires_watched_category_ids_any"].map(&:to_i).uniq
-        return false if req.present? && (watched_set.nil? || (watched_set & req).empty?)
+        if req.present? && (watched_set.nil? || (watched_set & req).empty?)
+          rc_inc!(rc, :"#{context || 'group'}:watched_any_failed")
+          return false
+        end
       end
 
       if group["requires_watched_category_ids_all"].is_a?(Array)
         req = group["requires_watched_category_ids_all"].map(&:to_i).uniq
         if req.present?
-          return false if watched_set.nil?
-          req.each { |cid| return false unless watched_set.include?(cid) }
+          if watched_set.nil?
+            rc_inc!(rc, :"#{context || 'group'}:watched_all_failed_nil")
+            return false
+          end
+          req.each do |cid|
+            unless watched_set.include?(cid)
+              rc_inc!(rc, :"#{context || 'group'}:watched_all_failed")
+              return false
+            end
+          end
         end
       end
 
-      return false unless check_watched_min_count!(group, watched_set)
+      unless check_watched_min_count!(group, watched_set)
+        rc_inc!(rc, :"#{context || 'group'}:watched_min_count_failed")
+        return false
+      end
 
       digest_count = stats["digest_count"].to_i rescue 0
       last_at = parse_time_utc(stats["last_digest_at_utc"])
 
       if group.key?("max_digest_count")
         maxc = group["max_digest_count"].to_i
-        return false if maxc >= 0 && digest_count > maxc
+        if maxc >= 0 && digest_count > maxc
+          rc_inc!(rc, :"#{context || 'group'}:max_digest_count_failed")
+          return false
+        end
       end
 
       if group.key?("min_days_since_last_digest")
         mind = group["min_days_since_last_digest"].to_i
         if last_at
           days = (now_utc - last_at) / 86400.0
-          return false if days < mind
+          if days < mind
+            rc_inc!(rc, :"#{context || 'group'}:min_days_since_failed")
+            return false
+          end
         end
       end
 
       if group.key?("max_days_since_last_digest")
         maxd = group["max_days_since_last_digest"].to_i
-        return false unless last_at
+        unless last_at
+          rc_inc!(rc, :"#{context || 'group'}:max_days_since_failed_no_last")
+          return false
+        end
         days = (now_utc - last_at) / 86400.0
-        return false if days > maxd
+        if days > maxd
+          rc_inc!(rc, :"#{context || 'group'}:max_days_since_failed")
+          return false
+        end
       end
 
       if group["requires_email_in_emails_lists_any"].is_a?(Array)
         names = group["requires_email_in_emails_lists_any"].map { |x| x.to_s.strip }.reject(&:blank?).uniq
         if names.present?
-          return false if group_references_missing_emails_list?(names, emails_lists_by_name)
+          if group_references_missing_emails_list?(names, emails_lists_by_name)
+            rc_inc!(rc, :"#{context || 'group'}:emails_list_missing_config_any")
+            return false
+          end
           ok = names.any? { |n| emails_lists_by_name[n].include?(email_norm) }
-          return false unless ok
+          unless ok
+            rc_inc!(rc, :"#{context || 'group'}:emails_list_any_failed")
+            return false
+          end
         end
       end
 
       if group["requires_email_in_emails_lists_all"].is_a?(Array)
         names = group["requires_email_in_emails_lists_all"].map { |x| x.to_s.strip }.reject(&:blank?).uniq
         if names.present?
-          return false if group_references_missing_emails_list?(names, emails_lists_by_name)
-          names.each { |n| return false unless emails_lists_by_name[n].include?(email_norm) }
+          if group_references_missing_emails_list?(names, emails_lists_by_name)
+            rc_inc!(rc, :"#{context || 'group'}:emails_list_missing_config_all")
+            return false
+          end
+          names.each do |n|
+            unless emails_lists_by_name[n].include?(email_norm)
+              rc_inc!(rc, :"#{context || 'group'}:emails_list_all_failed")
+              return false
+            end
+          end
         end
       end
 
       if group["requires_email_not_in_emails_lists_any"].is_a?(Array)
         names = group["requires_email_not_in_emails_lists_any"].map { |x| x.to_s.strip }.reject(&:blank?).uniq
         if names.present?
-          return false if group_references_missing_emails_list?(names, emails_lists_by_name)
+          if group_references_missing_emails_list?(names, emails_lists_by_name)
+            rc_inc!(rc, :"#{context || 'group'}:emails_list_missing_config_not_any")
+            return false
+          end
           blocked = names.any? { |n| emails_lists_by_name[n].include?(email_norm) }
-          return false if blocked
+          if blocked
+            rc_inc!(rc, :"#{context || 'group'}:emails_list_not_any_failed")
+            return false
+          end
         end
       end
 
+      rc_inc!(rc, :"#{context || 'group'}:matched")
       true
     end
 
-    def self.user_matches_any_group?(groups, **kwargs)
+    def self.user_matches_any_group?(groups, rc: nil, context: nil, **kwargs)
       groups.each do |g|
         next unless g.is_a?(Hash)
-        return true if user_matches_group?(g, **kwargs)
+        if user_matches_group?(g, **kwargs, rc: rc, context: context)
+          return true
+        end
       end
       false
     end
@@ -627,8 +738,14 @@ after_initialize do
       apply_inc = apply_includes?
       apply_exc = apply_excludes?
 
+      # Reason counters (only used when debug enabled)
+      rc = debug_enabled? ? Hash.new(0) : nil
+
       if apply_inc && eligible_groups.blank?
-        debug("No eligible groups configured AND apply_includes=true => filtering out all users")
+        rc_inc!(rc, :no_eligible_groups_configured)
+        debug("No eligible groups configured AND apply_includes=true => filtering out all users") if debug_enabled?
+        # Summary line:
+        debug("reason_counters #{rc_summary_string(rc)}") if debug_enabled?
         return []
       end
 
@@ -640,6 +757,9 @@ after_initialize do
       email_map = {}
       email_rows.each { |uid, em| email_map[uid] = em }
 
+      rc_inc!(rc, :base_total, base_user_ids.length)
+      rc_inc!(rc, :missing_primary_email, base_user_ids.length - email_map.length)
+
       groups_for_ref =
         []
           .tap { |arr| arr.concat(eligible_groups) if apply_inc }
@@ -648,6 +768,9 @@ after_initialize do
       emails_lists_config   = load_emails_lists_config
       referenced_list_names = collect_emails_list_names(groups_for_ref)
       emails_lists_by_name  = precompute_emails_lists_by_name(referenced_list_names, emails_lists_config)
+
+      # Missing emails_list configs referenced by any group (counts references, not users)
+      rc_merge_missing!(rc, find_missing_emails_list_refs_in_groups(groups_for_ref, emails_lists_by_name))
 
       # Collect category IDs referenced (any/all/min_count), including nested exclude
       all_cat_ids = []
@@ -686,6 +809,11 @@ after_initialize do
 
       base_user_ids.each do |uid|
         email_raw  = email_map[uid].to_s
+        if email_raw.blank?
+          rc_inc!(rc, :skipped_missing_email)
+          next
+        end
+
         email_norm = normalize_email(email_raw)
         domain     = email_domain_of(email_raw)
 
@@ -702,18 +830,34 @@ after_initialize do
           emails_lists_by_name: emails_lists_by_name
         }
 
-        if apply_exc && exclude_groups.present? && user_matches_any_group?(exclude_groups, **args)
+        excluded = false
+        if apply_exc && exclude_groups.present?
+          if user_matches_any_group?(exclude_groups, **args, rc: rc, context: "exclude")
+            excluded = true
+            rc_inc!(rc, :excluded_by_excludes)
+          end
+        end
+
+        if excluded
           next
         end
 
         if apply_inc
-          kept << uid if user_matches_any_group?(eligible_groups, **args)
+          if user_matches_any_group?(eligible_groups, **args, rc: rc, context: "include")
+            kept << uid
+            rc_inc!(rc, :kept)
+          else
+            rc_inc!(rc, :filtered_by_includes_no_match)
+          end
         else
           kept << uid
+          rc_inc!(rc, :kept)
         end
       end
 
       debug("filter_ids_by_rules base=#{base_user_ids.length} kept=#{kept.length} apply_includes=#{apply_inc} apply_excludes=#{apply_exc} eligible_groups=#{eligible_groups.length} exclude_groups=#{exclude_groups.length}")
+      debug("reason_counters #{rc_summary_string(rc)}") if debug_enabled?
+
       kept
     end
   end
