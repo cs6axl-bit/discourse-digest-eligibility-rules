@@ -1,15 +1,12 @@
 # frozen_string_literal: true
-#
 # name: discourse-digest-eligibility-rules
 # about: Configurable eligibility + exclusion condition-groups (OR of AND rules) to decide who receives digest emails, incl. PG emails_list checks + optional L1/L2 caching.
 # version: 2.4.0
 # authors: you
 # required_version: 3.0.0
-#
 # v2.4.0:
 # - Adds "reason counters" summary logs (no per-user spam)
 # - Updates user_stats.digest_attempted_at = now for skipped users (to prevent re-candidacy / backlog churn)
-#
 
 enabled_site_setting :digest_eligibility_rules_enabled
 
