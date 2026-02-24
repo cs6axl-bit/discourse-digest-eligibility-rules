@@ -6,7 +6,7 @@
 # required_version: 3.0.0
 # v2.4.0:
 # - Adds "reason counters" summary logs (no per-user spam)
-# - Updates user_stats.digest_attempted_at = now for skipped users (to prevent re-candidacy / backlog churn)
+# - Updates user_stats.digest_attempted_at to a random time between now and now+6 days 20 hours for skipped users (to prevent re-candidacy / backlog churn)
 
 enabled_site_setting :digest_eligibility_rules_enabled
 
@@ -208,6 +208,7 @@ after_initialize do
 
     # --------------------------------
     # Mark skipped users as "attempted" to avoid re-candidacy churn
+    # NOW: random time between now_utc and now_utc + 6 days 20 hours (per-row random)
     # --------------------------------
     def self.mark_digest_attempted_for_users!(user_ids, now_utc, rc: nil)
       ids = Array(user_ids).map(&:to_i).uniq
@@ -216,10 +217,20 @@ after_initialize do
       total = 0
       batch_size = 5_000
 
+      # digest_attempted_at = (now_utc + random() * interval '6 days 20 hours')
+      # Postgres evaluates random() per row (volatile), so each user gets a different value.
+      quoted_now =
+        begin
+          ActiveRecord::Base.connection.quote(now_utc)
+        rescue
+          "'#{now_utc.utc.iso8601}'"
+        end
+
+      attempted_expr = Arel.sql("(#{quoted_now}::timestamptz + (random() * interval '6 days 20 hours'))")
+
       ids.each_slice(batch_size) do |slice|
         begin
-          # update_all returns number of rows affected in AR
-          n = UserStat.where(user_id: slice).update_all(digest_attempted_at: now_utc)
+          n = UserStat.where(user_id: slice).update_all(digest_attempted_at: attempted_expr)
           total += (n.to_i rescue slice.length)
         rescue => e
           warn("mark_digest_attempted failed batch size=#{slice.length}: #{e.class}: #{e.message}")
@@ -877,6 +888,7 @@ after_initialize do
       end
 
       # IMPORTANT: Mark skipped users as "attempted" so they don't keep reappearing every 30 minutes.
+      # (Randomized between now and now+6 days 20 hours.)
       marked = mark_digest_attempted_for_users!(skipped_for_attempted, now_utc, rc: rc)
       rc_inc!(rc, :marked_digest_attempted_at_users, skipped_for_attempted.uniq.length) if rc
       debug("mark_digest_attempted_at skipped_users=#{skipped_for_attempted.uniq.length} rows=#{marked} at=#{now_utc.iso8601}") if debug_enabled?
