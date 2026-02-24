@@ -1,12 +1,15 @@
 # frozen_string_literal: true
+#
 # name: discourse-digest-eligibility-rules
 # about: Configurable eligibility + exclusion condition-groups (OR of AND rules) to decide who receives digest emails, incl. PG emails_list checks + optional L1/L2 caching.
-# version: 2.3.0
+# version: 2.4.0
 # authors: you
 # required_version: 3.0.0
-# v2.3.0:
+#
+# v2.4.0:
 # - Adds "reason counters" summary logs (no per-user spam)
-# - Counts why users were excluded / not included / missing config, etc.
+# - Updates user_stats.digest_attempted_at = now for skipped users (to prevent re-candidacy / backlog churn)
+#
 
 enabled_site_setting :digest_eligibility_rules_enabled
 
@@ -74,7 +77,7 @@ after_initialize do
     end
 
     # --------------------------------
-    # Stats
+    # Stats (PluginStore - informational only)
     # --------------------------------
     def self.stats_key(user_id)
       "#{STORE_KEY_PREFIX}#{user_id}"
@@ -200,11 +203,37 @@ after_initialize do
 
     def self.rc_summary_string(rc)
       return "" if rc.nil? || rc.empty?
-      # Sort by count desc then key
       pairs = rc.sort_by { |k, v| [-v.to_i, k.to_s] }
       pairs.map { |k, v| "#{k}=#{v}" }.join(" ")
     rescue
       ""
+    end
+
+    # --------------------------------
+    # Mark skipped users as "attempted" to avoid re-candidacy churn
+    # --------------------------------
+    def self.mark_digest_attempted_for_users!(user_ids, now_utc, rc: nil)
+      ids = Array(user_ids).map(&:to_i).uniq
+      return 0 if ids.empty?
+
+      total = 0
+      batch_size = 5_000
+
+      ids.each_slice(batch_size) do |slice|
+        begin
+          # update_all returns number of rows affected in AR
+          n = UserStat.where(user_id: slice).update_all(digest_attempted_at: now_utc)
+          total += (n.to_i rescue slice.length)
+        rescue => e
+          warn("mark_digest_attempted failed batch size=#{slice.length}: #{e.class}: #{e.message}")
+        end
+      end
+
+      rc_inc!(rc, :marked_digest_attempted_at_rows, total) if rc
+      total
+    rescue => e
+      warn("mark_digest_attempted failed: #{e.class}: #{e.message}")
+      0
     end
 
     # --------------------------------
@@ -540,7 +569,6 @@ after_initialize do
       names.any? { |n| !lists_by_name.key?(n) || lists_by_name[n].nil? }
     end
 
-    # For counters: returns { "NAME" => count_missing_refs_in_groups, ... }
     def self.find_missing_emails_list_refs_in_groups(groups, emails_lists_by_name)
       out = Hash.new(0)
       Array(groups).each do |g|
@@ -561,11 +589,9 @@ after_initialize do
     end
 
     # --------------------------------
-    # Group evaluation
-    # Adds optional reason counters (rc)
+    # Group evaluation (optional reason counters)
     # --------------------------------
     def self.user_matches_group?(group, user_id:, email_domain:, watched_set:, stats:, now_utc:, email_norm:, emails_lists_by_name:, rc: nil, context: nil)
-      # Nested exclude inside this group
       if group["exclude"].is_a?(Hash)
         if user_matches_group?(group["exclude"],
                                user_id: user_id,
@@ -735,13 +761,11 @@ after_initialize do
       apply_inc = apply_includes?
       apply_exc = apply_excludes?
 
-      # Reason counters (only used when debug enabled)
       rc = debug_enabled? ? Hash.new(0) : nil
 
       if apply_inc && eligible_groups.blank?
         rc_inc!(rc, :no_eligible_groups_configured)
         debug("No eligible groups configured AND apply_includes=true => filtering out all users") if debug_enabled?
-        # Summary line:
         debug("reason_counters #{rc_summary_string(rc)}") if debug_enabled?
         return []
       end
@@ -766,7 +790,6 @@ after_initialize do
       referenced_list_names = collect_emails_list_names(groups_for_ref)
       emails_lists_by_name  = precompute_emails_lists_by_name(referenced_list_names, emails_lists_config)
 
-      # Missing emails_list configs referenced by any group (counts references, not users)
       rc_merge_missing!(rc, find_missing_emails_list_refs_in_groups(groups_for_ref, emails_lists_by_name))
 
       # Collect category IDs referenced (any/all/min_count), including nested exclude
@@ -803,11 +826,13 @@ after_initialize do
       stats_map   = fetch_stats_map(base_user_ids)
 
       kept = []
+      skipped_for_attempted = [] # we will set user_stats.digest_attempted_at for these
 
       base_user_ids.each do |uid|
         email_raw  = email_map[uid].to_s
         if email_raw.blank?
           rc_inc!(rc, :skipped_missing_email)
+          skipped_for_attempted << uid
           next
         end
 
@@ -836,6 +861,7 @@ after_initialize do
         end
 
         if excluded
+          skipped_for_attempted << uid
           next
         end
 
@@ -845,12 +871,18 @@ after_initialize do
             rc_inc!(rc, :kept)
           else
             rc_inc!(rc, :filtered_by_includes_no_match)
+            skipped_for_attempted << uid
           end
         else
           kept << uid
           rc_inc!(rc, :kept)
         end
       end
+
+      # IMPORTANT: Mark skipped users as "attempted" so they don't keep reappearing every 30 minutes.
+      marked = mark_digest_attempted_for_users!(skipped_for_attempted, now_utc, rc: rc)
+      rc_inc!(rc, :marked_digest_attempted_at_users, skipped_for_attempted.uniq.length) if rc
+      debug("mark_digest_attempted_at skipped_users=#{skipped_for_attempted.uniq.length} rows=#{marked} at=#{now_utc.iso8601}") if debug_enabled?
 
       debug("filter_ids_by_rules base=#{base_user_ids.length} kept=#{kept.length} apply_includes=#{apply_inc} apply_excludes=#{apply_exc} eligible_groups=#{eligible_groups.length} exclude_groups=#{exclude_groups.length}")
       debug("reason_counters #{rc_summary_string(rc)}") if debug_enabled?
