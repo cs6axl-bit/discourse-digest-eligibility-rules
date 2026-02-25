@@ -1,12 +1,13 @@
 # frozen_string_literal: true
 # name: discourse-digest-eligibility-rules
 # about: Configurable eligibility + exclusion condition-groups (OR of AND rules) to decide who receives digest emails, incl. PG emails_list checks + optional L1/L2 caching.
-# version: 2.4.0
+# version: 2.5.0
 # authors: you
 # required_version: 3.0.0
-# v2.4.0:
-# - Adds "reason counters" summary logs (no per-user spam)
-# - Updates user_stats.digest_attempted_at to a random time between now and now+6 days 20 hours for skipped users (to prevent re-candidacy / backlog churn)
+# v2.5.0:
+# - Adds a switch to choose how skipped users get user_stats.digest_attempted_at:
+#     * "now" (exact now_utc)
+#     * "random_future" (now_utc + random up to 6 days 20 hours)
 
 enabled_site_setting :digest_eligibility_rules_enabled
 
@@ -71,6 +72,31 @@ after_initialize do
       SiteSetting.digest_eligibility_rules_apply_excludes
     rescue
       true
+    end
+
+    # --------------------------------
+    # NEW: Switch for how to mark skipped users' digest_attempted_at
+    #
+    # Expect SiteSetting:
+    #   digest_eligibility_rules_skipped_attempted_mode
+    #
+    # Values:
+    #   "now"           => set digest_attempted_at = now_utc
+    #   "random_future" => set digest_attempted_at = now_utc + random up to 6 days 20 hours
+    #
+    # If setting missing/blank/unknown => defaults to "random_future"
+    # --------------------------------
+    def self.skipped_attempted_mode
+      v = SiteSetting.digest_eligibility_rules_skipped_attempted_mode.to_s.strip.downcase
+      v = "random_future" if v.blank?
+      return v if %w[now random_future].include?(v)
+      "random_future"
+    rescue
+      "random_future"
+    end
+
+    def self.skipped_attempted_random_future?
+      skipped_attempted_mode == "random_future"
     end
 
     # --------------------------------
@@ -208,7 +234,11 @@ after_initialize do
 
     # --------------------------------
     # Mark skipped users as "attempted" to avoid re-candidacy churn
-    # NOW: random time between now_utc and now_utc + 6 days 20 hours (per-row random)
+    #
+    # Mode:
+    #  - now:          digest_attempted_at = now_utc
+    #  - random_future digest_attempted_at = now_utc + random() * interval '6 days 20 hours'
+    #                 (random() is volatile => per-row)
     # --------------------------------
     def self.mark_digest_attempted_for_users!(user_ids, now_utc, rc: nil)
       ids = Array(user_ids).map(&:to_i).uniq
@@ -217,8 +247,6 @@ after_initialize do
       total = 0
       batch_size = 5_000
 
-      # digest_attempted_at = (now_utc + random() * interval '6 days 20 hours')
-      # Postgres evaluates random() per row (volatile), so each user gets a different value.
       quoted_now =
         begin
           ActiveRecord::Base.connection.quote(now_utc)
@@ -226,7 +254,16 @@ after_initialize do
           "'#{now_utc.utc.iso8601}'"
         end
 
-      attempted_expr = Arel.sql("(#{quoted_now}::timestamptz + (random() * interval '6 days 20 hours'))")
+      mode = skipped_attempted_mode
+
+      attempted_expr =
+        if mode == "now"
+          # Use a literal cast for safety; same exact time for all rows in each batch.
+          Arel.sql("(#{quoted_now}::timestamptz)")
+        else
+          # Per-row random, spreads out re-candidacy over up to ~6.83 days.
+          Arel.sql("(#{quoted_now}::timestamptz + (random() * interval '6 days 20 hours'))")
+        end
 
       ids.each_slice(batch_size) do |slice|
         begin
@@ -238,6 +275,7 @@ after_initialize do
       end
 
       rc_inc!(rc, :marked_digest_attempted_at_rows, total) if rc
+      rc_inc!(rc, :"marked_digest_attempted_at_mode:#{mode}", total) if rc
       total
     rescue => e
       warn("mark_digest_attempted failed: #{e.class}: #{e.message}")
@@ -888,10 +926,13 @@ after_initialize do
       end
 
       # IMPORTANT: Mark skipped users as "attempted" so they don't keep reappearing every 30 minutes.
-      # (Randomized between now and now+6 days 20 hours.)
+      # Mode controlled by SiteSetting.digest_eligibility_rules_skipped_attempted_mode ("now" / "random_future")
       marked = mark_digest_attempted_for_users!(skipped_for_attempted, now_utc, rc: rc)
       rc_inc!(rc, :marked_digest_attempted_at_users, skipped_for_attempted.uniq.length) if rc
-      debug("mark_digest_attempted_at skipped_users=#{skipped_for_attempted.uniq.length} rows=#{marked} at=#{now_utc.iso8601}") if debug_enabled?
+
+      if debug_enabled?
+        debug("mark_digest_attempted_at mode=#{skipped_attempted_mode} skipped_users=#{skipped_for_attempted.uniq.length} rows=#{marked} at=#{now_utc.iso8601}")
+      end
 
       debug("filter_ids_by_rules base=#{base_user_ids.length} kept=#{kept.length} apply_includes=#{apply_inc} apply_excludes=#{apply_exc} eligible_groups=#{eligible_groups.length} exclude_groups=#{exclude_groups.length}")
       debug("reason_counters #{rc_summary_string(rc)}") if debug_enabled?
