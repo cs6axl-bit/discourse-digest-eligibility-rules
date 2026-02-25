@@ -62,6 +62,14 @@ plugins:
     default: 0
     client: false
 
+  digest_eligibility_rules_skipped_attempted_mode:
+    default: random_future
+    client: false
+    type: enum
+    choices:
+      - now
+      - random_future    
+
   # Shared cache key prefix (bump to hard-bust caches)
   digest_eligibility_emails_list_cache_prefix:
     default: "der:emails_list:v1"
