@@ -1,13 +1,15 @@
 # frozen_string_literal: true
 # name: discourse-digest-eligibility-rules
 # about: Configurable eligibility + exclusion condition-groups (OR of AND rules) to decide who receives digest emails, incl. PG emails_list checks + optional L1/L2 caching.
-# version: 2.5.0
+# version: 2.6.0
 # authors: you
 # required_version: 3.0.0
-# v2.5.0:
-# - Adds a switch to choose how skipped users get user_stats.digest_attempted_at:
-#     * "now" (exact now_utc)
-#     * "random_future" (now_utc + random up to 6 days 20 hours)
+# v2.6.0:
+# - Adds eligibility checks based on Discourse custom user fields by *field name*:
+#     requires_user_field_equals_any: [{field:"file", values:["a.csv","b.csv"]}, ...]
+#     requires_user_field_equals_all: [{field:"gender", values:["female"]}, ...]
+#   Works in include groups, exclude groups, and nested exclude.
+# - Bulk loads user_fields + user_custom_fields for base_user_ids for referenced fields (fast).
 
 enabled_site_setting :digest_eligibility_rules_enabled
 
@@ -33,13 +35,11 @@ after_initialize do
       return unless debug_enabled?
       Rails.logger.warn("[#{PLUGIN_NAME}] DEBUG #{msg}")
     rescue
-      # never block digests
     end
 
     def self.warn(msg)
       Rails.logger.warn("[#{PLUGIN_NAME}] #{msg}")
     rescue
-      # never block digests
     end
 
     # --------------------------------
@@ -75,16 +75,7 @@ after_initialize do
     end
 
     # --------------------------------
-    # NEW: Switch for how to mark skipped users' digest_attempted_at
-    #
-    # Expect SiteSetting:
-    #   digest_eligibility_rules_skipped_attempted_mode
-    #
-    # Values:
-    #   "now"           => set digest_attempted_at = now_utc
-    #   "random_future" => set digest_attempted_at = now_utc + random up to 6 days 20 hours
-    #
-    # If setting missing/blank/unknown => defaults to "random_future"
+    # Switch for how to mark skipped users' digest_attempted_at
     # --------------------------------
     def self.skipped_attempted_mode
       v = SiteSetting.digest_eligibility_rules_skipped_attempted_mode.to_s.strip.downcase
@@ -93,10 +84,6 @@ after_initialize do
       "random_future"
     rescue
       "random_future"
-    end
-
-    def self.skipped_attempted_random_future?
-      skipped_attempted_mode == "random_future"
     end
 
     # --------------------------------
@@ -214,14 +201,12 @@ after_initialize do
       return if rc.nil?
       rc[key] = (rc[key].to_i + n.to_i)
     rescue
-      # ignore
     end
 
     def self.rc_merge_missing!(rc, miss_hash)
       return if rc.nil? || miss_hash.nil?
       miss_hash.each { |k, v| rc_inc!(rc, :"missing_emails_list:#{k}", v.to_i) }
     rescue
-      # ignore
     end
 
     def self.rc_summary_string(rc)
@@ -234,11 +219,6 @@ after_initialize do
 
     # --------------------------------
     # Mark skipped users as "attempted" to avoid re-candidacy churn
-    #
-    # Mode:
-    #  - now:          digest_attempted_at = now_utc
-    #  - random_future digest_attempted_at = now_utc + random() * interval '6 days 20 hours'
-    #                 (random() is volatile => per-row)
     # --------------------------------
     def self.mark_digest_attempted_for_users!(user_ids, now_utc, rc: nil)
       ids = Array(user_ids).map(&:to_i).uniq
@@ -258,10 +238,8 @@ after_initialize do
 
       attempted_expr =
         if mode == "now"
-          # Use a literal cast for safety; same exact time for all rows in each batch.
           Arel.sql("(#{quoted_now}::timestamptz)")
         else
-          # Per-row random, spreads out re-candidacy over up to ~6.83 days.
           Arel.sql("(#{quoted_now}::timestamptz + (random() * interval '6 days 20 hours'))")
         end
 
@@ -284,7 +262,6 @@ after_initialize do
 
     # --------------------------------
     # Watched category map (bulk)
-    # user_id => Set(category_id) for watched levels
     # --------------------------------
     def self.fetch_watched_category_map(user_ids, all_needed_category_ids)
       return {} if user_ids.blank? || all_needed_category_ids.blank?
@@ -305,7 +282,6 @@ after_initialize do
 
     # --------------------------------
     # Watched min-count
-    # group["requires_watched_category_ids_min_count"] = {"category_ids":[...], "min_count":3}
     # --------------------------------
     def self.check_watched_min_count!(group, watched_set)
       obj = group["requires_watched_category_ids_min_count"]
@@ -411,14 +387,6 @@ after_initialize do
       emails_list_cache_ttl_seconds.to_i
     end
 
-    # --------------------------------
-    # emails_list config (UNLIMITED)
-    # SiteSetting.digest_eligibility_emails_lists_json:
-    # [
-    #   {"name":"A","table":"emails_list_a","column":"email"},
-    #   {"name":"B","table":"emails_list_b","column":"email"}
-    # ]
-    # --------------------------------
     def self.load_emails_lists_config
       raw = SiteSetting.digest_eligibility_emails_lists_json.to_s.strip
       return {} if raw.blank?
@@ -436,7 +404,7 @@ after_initialize do
         c = "email" if c.blank?
 
         next unless valid_ident?(name) && valid_ident?(t) && valid_ident?(c)
-        out[name] = { table: t, column: c } # duplicate names => last wins
+        out[name] = { table: t, column: c }
       end
       out
     rescue => e
@@ -444,10 +412,6 @@ after_initialize do
       {}
     end
 
-    # --------------------------------
-    # DB load: fetch ALL emails from public.<table>.<column>
-    # returns Array (lowercased, uniq)
-    # --------------------------------
     def self.load_all_emails_array_from_pg(table_name, column_name)
       t = table_name.to_s.strip
       c = column_name.to_s.strip
@@ -506,12 +470,6 @@ after_initialize do
       []
     end
 
-    # --------------------------------
-    # Fetch ALL emails with caching:
-    # - L1 in-process (optional)
-    # - L2 Discourse.cache (cross-process) (optional)
-    # returns Set
-    # --------------------------------
     def self.fetch_all_emails_from_pg_list(table_name, column_name)
       t = table_name.to_s.strip
       c = column_name.to_s.strip
@@ -525,7 +483,6 @@ after_initialize do
       ttl = effective_ttl_seconds
       now = Time.now.to_i
 
-      # L1
       l1k = l1_cache_key(t, c)
       if l1_enabled? && ttl > 0
         cached = l1_cache[l1k]
@@ -534,7 +491,6 @@ after_initialize do
         end
       end
 
-      # L2
       arr = nil
       if l2_enabled? && ttl > 0
         l2k = l2_cache_key(t, c)
@@ -556,12 +512,122 @@ after_initialize do
 
       arr ||= load_all_emails_array_from_pg(t, c)
 
-      # store L1
       if l1_enabled? && ttl > 0
         l1_cache[l1k] = { expires_at: now + ttl, emails: arr }
       end
 
       Set.new(arr)
+    end
+
+    # --------------------------------
+    # NEW: User field requirements (by field *name*)
+    # --------------------------------
+    def self.collect_user_field_names_from_group(g, out)
+      return unless g.is_a?(Hash)
+
+      %w[requires_user_field_equals_any requires_user_field_equals_all].each do |k|
+        next unless g[k].is_a?(Array)
+        g[k].each do |clause|
+          next unless clause.is_a?(Hash)
+          fname = clause["field"].to_s.strip
+          out << fname unless fname.blank?
+        end
+      end
+
+      collect_user_field_names_from_group(g["exclude"], out) if g["exclude"].is_a?(Hash)
+    end
+
+    def self.collect_user_field_names(groups)
+      out = []
+      Array(groups).each { |g| collect_user_field_names_from_group(g, out) }
+      out.map(&:to_s).map(&:strip).reject(&:blank?).uniq
+    end
+
+    # Returns map: field_name => field_id
+    def self.fetch_user_field_ids_by_name(field_names)
+      names = Array(field_names).map { |x| x.to_s.strip }.reject(&:blank?).uniq
+      return {} if names.empty?
+      UserField.where(name: names).pluck(:name, :id).to_h
+    rescue => e
+      warn("fetch_user_field_ids_by_name failed: #{e.class}: #{e.message}")
+      {}
+    end
+
+    # Returns map: user_id => { "file"=>"abc", "gender"=>"female", ... } for referenced fields only
+    def self.fetch_user_custom_fields_map(user_ids, field_ids_by_name)
+      return {} if user_ids.blank? || field_ids_by_name.blank?
+
+      wanted = field_ids_by_name.map { |name, id| ["user_field_#{id}", name] }.to_h
+      keys = wanted.keys
+      return {} if keys.empty?
+
+      rows =
+        UserCustomField
+          .where(user_id: user_ids, name: keys)
+          .pluck(:user_id, :name, :value)
+
+      out = Hash.new { |h, k| h[k] = {} }
+      rows.each do |uid, key, val|
+        fname = wanted[key]
+        next if fname.blank?
+        out[uid][fname] = val.to_s
+      end
+      out
+    rescue => e
+      warn("fetch_user_custom_fields_map failed: #{e.class}: #{e.message}")
+      {}
+    end
+
+    def self.check_user_field_clause_any!(clauses, user_field_values_by_name, rc: nil, context: nil)
+      return true unless clauses.is_a?(Array) && clauses.present?
+
+      # OR across clauses: any clause satisfied => pass
+      clauses.each do |clause|
+        next unless clause.is_a?(Hash)
+        fname  = clause["field"].to_s.strip
+        values = clause["values"]
+        next if fname.blank? || !values.is_a?(Array)
+
+        have = user_field_values_by_name[fname].to_s
+        want = values.map { |x| x.to_s }.reject(&:blank?)
+        next if want.empty?
+
+        if want.include?(have)
+          rc_inc!(rc, :"#{context || 'group'}:user_field_any_matched") if rc
+          return true
+        end
+      end
+
+      rc_inc!(rc, :"#{context || 'group'}:user_field_any_failed") if rc
+      false
+    rescue
+      false
+    end
+
+    def self.check_user_field_clause_all!(clauses, user_field_values_by_name, rc: nil, context: nil)
+      return true unless clauses.is_a?(Array) && clauses.present?
+
+      # AND across clauses: every clause must be satisfied
+      clauses.each do |clause|
+        next unless clause.is_a?(Hash)
+        fname  = clause["field"].to_s.strip
+        values = clause["values"]
+        return false if fname.blank? || !values.is_a?(Array)
+
+        have = user_field_values_by_name[fname].to_s
+        want = values.map { |x| x.to_s }.reject(&:blank?)
+        return false if want.empty?
+
+        unless want.include?(have)
+          rc_inc!(rc, :"#{context || 'group'}:user_field_all_failed") if rc
+          return false
+        end
+      end
+
+      rc_inc!(rc, :"#{context || 'group'}:user_field_all_matched") if rc
+      true
+    rescue
+      false
     end
 
     # --------------------------------
@@ -635,9 +701,9 @@ after_initialize do
     end
 
     # --------------------------------
-    # Group evaluation (optional reason counters)
+    # Group evaluation
     # --------------------------------
-    def self.user_matches_group?(group, user_id:, email_domain:, watched_set:, stats:, now_utc:, email_norm:, emails_lists_by_name:, rc: nil, context: nil)
+    def self.user_matches_group?(group, user_id:, email_domain:, watched_set:, stats:, now_utc:, email_norm:, emails_lists_by_name:, user_fields_by_name:, rc: nil, context: nil)
       if group["exclude"].is_a?(Hash)
         if user_matches_group?(group["exclude"],
                                user_id: user_id,
@@ -647,11 +713,23 @@ after_initialize do
                                now_utc: now_utc,
                                email_norm: email_norm,
                                emails_lists_by_name: emails_lists_by_name,
+                               user_fields_by_name: user_fields_by_name,
                                rc: rc,
                                context: "nested_exclude")
           rc_inc!(rc, :"#{context || 'group'}:blocked_by_nested_exclude")
           return false
         end
+      end
+
+      # NEW: user field checks
+      if group["requires_user_field_equals_any"].is_a?(Array)
+        ok = check_user_field_clause_any!(group["requires_user_field_equals_any"], user_fields_by_name, rc: rc, context: context || "group")
+        return false unless ok
+      end
+
+      if group["requires_user_field_equals_all"].is_a?(Array)
+        ok = check_user_field_clause_all!(group["requires_user_field_equals_all"], user_fields_by_name, rc: rc, context: context || "group")
+        return false unless ok
       end
 
       if group["email_domain_in"].is_a?(Array)
@@ -838,7 +916,7 @@ after_initialize do
 
       rc_merge_missing!(rc, find_missing_emails_list_refs_in_groups(groups_for_ref, emails_lists_by_name))
 
-      # Collect category IDs referenced (any/all/min_count), including nested exclude
+      # categories referenced
       all_cat_ids = []
       groups_for_ref.each do |g|
         next unless g.is_a?(Hash)
@@ -871,8 +949,17 @@ after_initialize do
       watched_map = fetch_watched_category_map(base_user_ids, all_cat_ids)
       stats_map   = fetch_stats_map(base_user_ids)
 
+      # NEW: user field references + bulk load
+      referenced_user_field_names = collect_user_field_names(groups_for_ref)
+      field_ids_by_name = fetch_user_field_ids_by_name(referenced_user_field_names)
+      user_custom_fields_map = fetch_user_custom_fields_map(base_user_ids, field_ids_by_name)
+
+      if debug_enabled? && referenced_user_field_names.present?
+        debug("user_fields referenced=#{referenced_user_field_names.join(',')} found=#{field_ids_by_name.keys.join(',')}")
+      end
+
       kept = []
-      skipped_for_attempted = [] # we will set user_stats.digest_attempted_at for these
+      skipped_for_attempted = []
 
       base_user_ids.each do |uid|
         email_raw  = email_map[uid].to_s
@@ -887,6 +974,7 @@ after_initialize do
 
         watched_set = watched_map[uid] || Set.new
         stats       = stats_for_user(stats_map, uid)
+        user_fields_by_name = user_custom_fields_map[uid] || {}
 
         args = {
           user_id: uid,
@@ -895,7 +983,8 @@ after_initialize do
           stats: stats,
           now_utc: now_utc,
           email_norm: email_norm,
-          emails_lists_by_name: emails_lists_by_name
+          emails_lists_by_name: emails_lists_by_name,
+          user_fields_by_name: user_fields_by_name
         }
 
         excluded = false
@@ -925,8 +1014,6 @@ after_initialize do
         end
       end
 
-      # IMPORTANT: Mark skipped users as "attempted" so they don't keep reappearing every 30 minutes.
-      # Mode controlled by SiteSetting.digest_eligibility_rules_skipped_attempted_mode ("now" / "random_future")
       marked = mark_digest_attempted_for_users!(skipped_for_attempted, now_utc, rc: rc)
       rc_inc!(rc, :marked_digest_attempted_at_users, skipped_for_attempted.uniq.length) if rc
 
