@@ -1,14 +1,15 @@
 # frozen_string_literal: true
 # name: discourse-digest-eligibility-rules
 # about: Configurable eligibility + exclusion condition-groups (OR of AND rules) to decide who receives digest emails, incl. PG emails_list checks + optional L1/L2 caching.
-# version: 2.6.1
+# version: 2.6.2
 # authors: you
 # required_version: 3.0.0
-# v2.6.1:
-# - Adds much more debugging around digest filtering + enqueue path.
-# - Logs whether patch attached, whether target_user_ids is hit, whether enqueue_for_user is hit,
-#   whether plugin is enabled at runtime, and whether bump_stats! wrote data.
-# - Adds helper logs for manual verification of method presence on Jobs::EnqueueDigestEmails.
+# v2.6.2:
+# - FIX: stop relying on enqueue_for_user for stats counting (it is not hit in this Discourse flow).
+# - Stats are now recorded from execute, based on the filtered target_user_ids captured during the run.
+# - Keeps detailed debug logs for target_user_ids + execute flow.
+# - Adds per-run de-dup guard so stats are bumped once per user_id per job execution.
+# - Keeps existing include/exclude logic unchanged.
 
 enabled_site_setting :digest_eligibility_rules_enabled
 
@@ -148,6 +149,21 @@ after_initialize do
     rescue => e
       warn("bump_stats failed user_id=#{user_id}: #{e.class}: #{e.message}")
       nil
+    end
+
+    def self.bump_stats_for_users!(user_ids, now_utc)
+      ids = Array(user_ids).map(&:to_i).uniq
+      return 0 if ids.empty?
+
+      cnt = 0
+      ids.each do |uid|
+        data = bump_stats!(uid, now_utc)
+        cnt += 1 if data.present?
+      end
+      cnt
+    rescue => e
+      warn("bump_stats_for_users failed: #{e.class}: #{e.message}")
+      0
     end
 
     # --------------------------------
@@ -553,7 +569,6 @@ after_initialize do
       out.map(&:to_s).map(&:strip).reject(&:blank?).uniq
     end
 
-    # Returns map: field_name => field_id
     def self.fetch_user_field_ids_by_name(field_names)
       names = Array(field_names).map { |x| x.to_s.strip }.reject(&:blank?).uniq
       return {} if names.empty?
@@ -563,7 +578,6 @@ after_initialize do
       {}
     end
 
-    # Returns map: user_id => { "file"=>"abc", "gender"=>"female", ... } for referenced fields only
     def self.fetch_user_custom_fields_map(user_ids, field_ids_by_name)
       return {} if user_ids.blank? || field_ids_by_name.blank?
 
@@ -1056,10 +1070,12 @@ after_initialize do
 
         unless ::DigestEligibilityRules.enabled?
           ::DigestEligibilityRules.warn("target_user_ids BYPASS because plugin disabled")
+          @digest_eligibility_filtered_ids = ids
           return ids
         end
 
         out = ::DigestEligibilityRules.filter_ids_by_rules(ids)
+        @digest_eligibility_filtered_ids = Array(out).map(&:to_i).uniq
 
         begin
           sample_out = out.respond_to?(:first) ? out.first(10) : []
@@ -1074,31 +1090,34 @@ after_initialize do
         raise
       end
 
-      def enqueue_for_user(user_id)
-        ::DigestEligibilityRules.warn("enqueue_for_user HIT user_id=#{user_id} class=#{self.class.name} #{::DigestEligibilityRules.runtime_state_string}")
+      def execute(args = nil)
+        ::DigestEligibilityRules.warn("execute HIT class=#{self.class.name} #{::DigestEligibilityRules.runtime_state_string}")
 
-        begin
-          u = User.find_by(id: user_id)
-          em = UserEmail.where(user_id: user_id, primary: true).pluck(:email).first
-          ::DigestEligibilityRules.warn("enqueue_for_user user_lookup user_exists=#{u.present?} username=#{u&.username.inspect} email=#{em.inspect}")
-        rescue => e
-          ::DigestEligibilityRules.warn("enqueue_for_user user lookup failed user_id=#{user_id}: #{e.class}: #{e.message}")
-        end
+        @digest_eligibility_filtered_ids = nil
+        @digest_eligibility_stats_bumped_ids = Set.new
 
         result = super
 
         unless ::DigestEligibilityRules.enabled?
-          ::DigestEligibilityRules.warn("enqueue_for_user SKIP bump_stats because plugin disabled user_id=#{user_id}")
+          ::DigestEligibilityRules.warn("execute SKIP stats bump because plugin disabled")
           return result
         end
 
-        now_utc = Time.now.utc
-        data = ::DigestEligibilityRules.bump_stats!(user_id, now_utc)
-        ::DigestEligibilityRules.warn("enqueue_for_user bump_stats DONE user_id=#{user_id} at=#{now_utc.iso8601} data=#{data.inspect}")
+        ids = Array(@digest_eligibility_filtered_ids).map(&:to_i).uniq
+        if ids.empty?
+          ::DigestEligibilityRules.warn("execute NO filtered ids captured; no stats bumped")
+          return result
+        end
 
+        ids_to_bump = ids - @digest_eligibility_stats_bumped_ids.to_a
+        now_utc = Time.now.utc
+        bumped = ::DigestEligibilityRules.bump_stats_for_users!(ids_to_bump, now_utc)
+        ids_to_bump.each { |id| @digest_eligibility_stats_bumped_ids << id }
+
+        ::DigestEligibilityRules.warn("execute STATS bump complete filtered_ids=#{ids.length} bumped_now=#{bumped} sample=#{ids.first(10).inspect} at=#{now_utc.iso8601}")
         result
       rescue => e
-        ::DigestEligibilityRules.warn("enqueue_for_user ERROR user_id=#{user_id}: #{e.class}: #{e.message}\n#{e.backtrace&.first(15)&.join("\n")}")
+        ::DigestEligibilityRules.warn("execute ERROR #{e.class}: #{e.message}\n#{e.backtrace&.first(15)&.join("\n")}")
         raise
       end
     end
@@ -1121,11 +1140,11 @@ after_initialize do
         ::Jobs::EnqueueDigestEmails.instance_methods(true).map(&:to_s).include?("target_user_ids") ||
           ::Jobs::EnqueueDigestEmails.private_instance_methods(true).map(&:to_s).include?("target_user_ids")
 
-      has_enqueue =
-        ::Jobs::EnqueueDigestEmails.instance_methods(true).map(&:to_s).include?("enqueue_for_user") ||
-          ::Jobs::EnqueueDigestEmails.private_instance_methods(true).map(&:to_s).include?("enqueue_for_user")
+      has_execute =
+        ::Jobs::EnqueueDigestEmails.instance_methods(true).map(&:to_s).include?("execute") ||
+          ::Jobs::EnqueueDigestEmails.private_instance_methods(true).map(&:to_s).include?("execute")
 
-      ::DigestEligibilityRules.warn("Post-patch method presence target_user_ids=#{has_target} enqueue_for_user=#{has_enqueue}")
+      ::DigestEligibilityRules.warn("Post-patch method presence target_user_ids=#{has_target} execute=#{has_execute}")
       ::DigestEligibilityRules.warn("Plugin runtime state after patch: #{::DigestEligibilityRules.runtime_state_string}")
     rescue => e
       ::DigestEligibilityRules.warn("ERROR while patching Jobs::EnqueueDigestEmails: #{e.class}: #{e.message}\n#{e.backtrace&.first(15)&.join("\n")}")
