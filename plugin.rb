@@ -1,15 +1,14 @@
 # frozen_string_literal: true
 # name: discourse-digest-eligibility-rules
 # about: Configurable eligibility + exclusion condition-groups (OR of AND rules) to decide who receives digest emails, incl. PG emails_list checks + optional L1/L2 caching.
-# version: 2.6.0
+# version: 2.6.1
 # authors: you
 # required_version: 3.0.0
-# v2.6.0:
-# - Adds eligibility checks based on Discourse custom user fields by *field name*:
-#     requires_user_field_equals_any: [{field:"file", values:["a.csv","b.csv"]}, ...]
-#     requires_user_field_equals_all: [{field:"gender", values:["female"]}, ...]
-#   Works in include groups, exclude groups, and nested exclude.
-# - Bulk loads user_fields + user_custom_fields for base_user_ids for referenced fields (fast).
+# v2.6.1:
+# - Adds much more debugging around digest filtering + enqueue path.
+# - Logs whether patch attached, whether target_user_ids is hit, whether enqueue_for_user is hit,
+#   whether plugin is enabled at runtime, and whether bump_stats! wrote data.
+# - Adds helper logs for manual verification of method presence on Jobs::EnqueueDigestEmails.
 
 enabled_site_setting :digest_eligibility_rules_enabled
 
@@ -57,6 +56,12 @@ after_initialize do
       SiteSetting.digest_eligibility_rules_enabled
     rescue
       false
+    end
+
+    def self.runtime_state_string
+      "enabled=#{enabled?} site_setting=#{(SiteSetting.digest_eligibility_rules_enabled rescue 'ERR')} global_off=#{globally_off?} env_global_off=#{ENV['DIGEST_ELIGIBILITY_GLOBAL_OFF'].inspect}"
+    rescue => e
+      "runtime_state_error=#{e.class}: #{e.message}"
     end
 
     # --------------------------------
@@ -136,6 +141,9 @@ after_initialize do
       data["last_digest_at_utc"] = now_utc.utc.iso8601
 
       PluginStore.set(PLUGIN_NAME, key, data.to_json)
+
+      verify_raw = PluginStore.get(PLUGIN_NAME, key)
+      debug("bump_stats! user_id=#{user_id} key=#{key} old_raw=#{raw.inspect} new_data=#{data.inspect} verify_raw=#{verify_raw.inspect}")
       data
     rescue => e
       warn("bump_stats failed user_id=#{user_id}: #{e.class}: #{e.message}")
@@ -487,6 +495,7 @@ after_initialize do
       if l1_enabled? && ttl > 0
         cached = l1_cache[l1k]
         if cached && cached[:expires_at].to_i > now
+          debug("emails_list L1 HIT key=#{l1k} rows=#{(cached[:emails] || []).length}")
           return Set.new(cached[:emails] || [])
         end
       end
@@ -503,7 +512,7 @@ after_initialize do
 
           arr = [] unless arr.is_a?(Array)
           arr = arr.map { |x| x.to_s.strip.downcase }.reject(&:blank?).uniq
-          debug("emails_list L2 HIT key=#{l2k} rows=#{arr.length}") if debug_enabled?
+          debug("emails_list L2 HIT/MISS-RETURN key=#{l2k} rows=#{arr.length}")
         rescue => e
           debug("emails_list L2 fetch failed key=#{l2k}: #{e.class}: #{e.message}")
           arr = nil
@@ -514,13 +523,14 @@ after_initialize do
 
       if l1_enabled? && ttl > 0
         l1_cache[l1k] = { expires_at: now + ttl, emails: arr }
+        debug("emails_list L1 STORE key=#{l1k} rows=#{arr.length} ttl=#{ttl}")
       end
 
       Set.new(arr)
     end
 
     # --------------------------------
-    # NEW: User field requirements (by field *name*)
+    # User field requirements (by field *name*)
     # --------------------------------
     def self.collect_user_field_names_from_group(g, out)
       return unless g.is_a?(Hash)
@@ -581,7 +591,6 @@ after_initialize do
     def self.check_user_field_clause_any!(clauses, user_field_values_by_name, rc: nil, context: nil)
       return true unless clauses.is_a?(Array) && clauses.present?
 
-      # OR across clauses: any clause satisfied => pass
       clauses.each do |clause|
         next unless clause.is_a?(Hash)
         fname  = clause["field"].to_s.strip
@@ -607,7 +616,6 @@ after_initialize do
     def self.check_user_field_clause_all!(clauses, user_field_values_by_name, rc: nil, context: nil)
       return true unless clauses.is_a?(Array) && clauses.present?
 
-      # AND across clauses: every clause must be satisfied
       clauses.each do |clause|
         next unless clause.is_a?(Hash)
         fname  = clause["field"].to_s.strip
@@ -721,7 +729,6 @@ after_initialize do
         end
       end
 
-      # NEW: user field checks
       if group["requires_user_field_equals_any"].is_a?(Array)
         ok = check_user_field_clause_any!(group["requires_user_field_equals_any"], user_fields_by_name, rc: rc, context: context || "group")
         return false unless ok
@@ -887,10 +894,12 @@ after_initialize do
 
       rc = debug_enabled? ? Hash.new(0) : nil
 
+      debug("filter_ids_by_rules START base_count=#{base_user_ids.length} #{runtime_state_string} apply_includes=#{apply_inc} apply_excludes=#{apply_exc}")
+
       if apply_inc && eligible_groups.blank?
         rc_inc!(rc, :no_eligible_groups_configured)
-        debug("No eligible groups configured AND apply_includes=true => filtering out all users") if debug_enabled?
-        debug("reason_counters #{rc_summary_string(rc)}") if debug_enabled?
+        debug("No eligible groups configured AND apply_includes=true => filtering out all users")
+        debug("reason_counters #{rc_summary_string(rc)}")
         return []
       end
 
@@ -916,7 +925,6 @@ after_initialize do
 
       rc_merge_missing!(rc, find_missing_emails_list_refs_in_groups(groups_for_ref, emails_lists_by_name))
 
-      # categories referenced
       all_cat_ids = []
       groups_for_ref.each do |g|
         next unless g.is_a?(Hash)
@@ -949,7 +957,6 @@ after_initialize do
       watched_map = fetch_watched_category_map(base_user_ids, all_cat_ids)
       stats_map   = fetch_stats_map(base_user_ids)
 
-      # NEW: user field references + bulk load
       referenced_user_field_names = collect_user_field_names(groups_for_ref)
       field_ids_by_name = fetch_user_field_ids_by_name(referenced_user_field_names)
       user_custom_fields_map = fetch_user_custom_fields_map(base_user_ids, field_ids_by_name)
@@ -962,7 +969,7 @@ after_initialize do
       skipped_for_attempted = []
 
       base_user_ids.each do |uid|
-        email_raw  = email_map[uid].to_s
+        email_raw = email_map[uid].to_s
         if email_raw.blank?
           rc_inc!(rc, :skipped_missing_email)
           skipped_for_attempted << uid
@@ -997,6 +1004,7 @@ after_initialize do
 
         if excluded
           skipped_for_attempted << uid
+          debug("user_id=#{uid} email=#{email_norm} RESULT=excluded") if debug_enabled?
           next
         end
 
@@ -1004,24 +1012,24 @@ after_initialize do
           if user_matches_any_group?(eligible_groups, **args, rc: rc, context: "include")
             kept << uid
             rc_inc!(rc, :kept)
+            debug("user_id=#{uid} email=#{email_norm} RESULT=kept") if debug_enabled?
           else
             rc_inc!(rc, :filtered_by_includes_no_match)
             skipped_for_attempted << uid
+            debug("user_id=#{uid} email=#{email_norm} RESULT=filtered_no_include_match") if debug_enabled?
           end
         else
           kept << uid
           rc_inc!(rc, :kept)
+          debug("user_id=#{uid} email=#{email_norm} RESULT=kept_no_include_filter") if debug_enabled?
         end
       end
 
       marked = mark_digest_attempted_for_users!(skipped_for_attempted, now_utc, rc: rc)
       rc_inc!(rc, :marked_digest_attempted_at_users, skipped_for_attempted.uniq.length) if rc
 
-      if debug_enabled?
-        debug("mark_digest_attempted_at mode=#{skipped_attempted_mode} skipped_users=#{skipped_for_attempted.uniq.length} rows=#{marked} at=#{now_utc.iso8601}")
-      end
-
-      debug("filter_ids_by_rules base=#{base_user_ids.length} kept=#{kept.length} apply_includes=#{apply_inc} apply_excludes=#{apply_exc} eligible_groups=#{eligible_groups.length} exclude_groups=#{exclude_groups.length}")
+      debug("mark_digest_attempted_at mode=#{skipped_attempted_mode} skipped_users=#{skipped_for_attempted.uniq.length} rows=#{marked} at=#{now_utc.iso8601}")
+      debug("filter_ids_by_rules END base=#{base_user_ids.length} kept=#{kept.length} skipped=#{skipped_for_attempted.uniq.length} eligible_groups=#{eligible_groups.length} exclude_groups=#{exclude_groups.length}")
       debug("reason_counters #{rc_summary_string(rc)}") if debug_enabled?
 
       kept
@@ -1035,22 +1043,93 @@ after_initialize do
   module ::DigestEligibilityRules
     module EnqueueDigestEmailsPatch
       def target_user_ids
+        ::DigestEligibilityRules.warn("target_user_ids HIT class=#{self.class.name} #{::DigestEligibilityRules.runtime_state_string}")
+
         ids = super
-        return ids unless ::DigestEligibilityRules.enabled?
-        ::DigestEligibilityRules.filter_ids_by_rules(ids)
+
+        begin
+          sample = ids.respond_to?(:first) ? ids.first(10) : []
+          ::DigestEligibilityRules.warn("target_user_ids SUPER returned count=#{ids.length rescue 'nil'} sample=#{sample.inspect}")
+        rescue => e
+          ::DigestEligibilityRules.warn("target_user_ids sample/log failed: #{e.class}: #{e.message}")
+        end
+
+        unless ::DigestEligibilityRules.enabled?
+          ::DigestEligibilityRules.warn("target_user_ids BYPASS because plugin disabled")
+          return ids
+        end
+
+        out = ::DigestEligibilityRules.filter_ids_by_rules(ids)
+
+        begin
+          sample_out = out.respond_to?(:first) ? out.first(10) : []
+          ::DigestEligibilityRules.warn("target_user_ids FILTERED count=#{out.length rescue 'nil'} sample=#{sample_out.inspect}")
+        rescue => e
+          ::DigestEligibilityRules.warn("target_user_ids filtered sample/log failed: #{e.class}: #{e.message}")
+        end
+
+        out
+      rescue => e
+        ::DigestEligibilityRules.warn("target_user_ids ERROR #{e.class}: #{e.message}\n#{e.backtrace&.first(15)&.join("\n")}")
+        raise
       end
 
       def enqueue_for_user(user_id)
-        super
-        return unless ::DigestEligibilityRules.enabled?
-        ::DigestEligibilityRules.bump_stats!(user_id, Time.now.utc)
+        ::DigestEligibilityRules.warn("enqueue_for_user HIT user_id=#{user_id} class=#{self.class.name} #{::DigestEligibilityRules.runtime_state_string}")
+
+        begin
+          u = User.find_by(id: user_id)
+          em = UserEmail.where(user_id: user_id, primary: true).pluck(:email).first
+          ::DigestEligibilityRules.warn("enqueue_for_user user_lookup user_exists=#{u.present?} username=#{u&.username.inspect} email=#{em.inspect}")
+        rescue => e
+          ::DigestEligibilityRules.warn("enqueue_for_user user lookup failed user_id=#{user_id}: #{e.class}: #{e.message}")
+        end
+
+        result = super
+
+        unless ::DigestEligibilityRules.enabled?
+          ::DigestEligibilityRules.warn("enqueue_for_user SKIP bump_stats because plugin disabled user_id=#{user_id}")
+          return result
+        end
+
+        now_utc = Time.now.utc
+        data = ::DigestEligibilityRules.bump_stats!(user_id, now_utc)
+        ::DigestEligibilityRules.warn("enqueue_for_user bump_stats DONE user_id=#{user_id} at=#{now_utc.iso8601} data=#{data.inspect}")
+
+        result
+      rescue => e
+        ::DigestEligibilityRules.warn("enqueue_for_user ERROR user_id=#{user_id}: #{e.class}: #{e.message}\n#{e.backtrace&.first(15)&.join("\n")}")
+        raise
       end
     end
   end
 
   if defined?(::Jobs::EnqueueDigestEmails)
-    ::Jobs::EnqueueDigestEmails.prepend(::DigestEligibilityRules::EnqueueDigestEmailsPatch)
-    ::DigestEligibilityRules.debug("Patched Jobs::EnqueueDigestEmails")
+    begin
+      job_methods = ::Jobs::EnqueueDigestEmails.instance_methods(false).map(&:to_s).sort
+      job_private_methods = ::Jobs::EnqueueDigestEmails.private_instance_methods(false).map(&:to_s).sort
+
+      ::DigestEligibilityRules.warn("Jobs::EnqueueDigestEmails found. public_methods=#{job_methods.inspect}")
+      ::DigestEligibilityRules.warn("Jobs::EnqueueDigestEmails found. private_methods=#{job_private_methods.inspect}")
+
+      ::Jobs::EnqueueDigestEmails.prepend(::DigestEligibilityRules::EnqueueDigestEmailsPatch)
+
+      ancestors_sample = ::Jobs::EnqueueDigestEmails.ancestors.take(10).map(&:to_s)
+      ::DigestEligibilityRules.warn("Patched Jobs::EnqueueDigestEmails ancestors=#{ancestors_sample.inspect}")
+
+      has_target =
+        ::Jobs::EnqueueDigestEmails.instance_methods(true).map(&:to_s).include?("target_user_ids") ||
+          ::Jobs::EnqueueDigestEmails.private_instance_methods(true).map(&:to_s).include?("target_user_ids")
+
+      has_enqueue =
+        ::Jobs::EnqueueDigestEmails.instance_methods(true).map(&:to_s).include?("enqueue_for_user") ||
+          ::Jobs::EnqueueDigestEmails.private_instance_methods(true).map(&:to_s).include?("enqueue_for_user")
+
+      ::DigestEligibilityRules.warn("Post-patch method presence target_user_ids=#{has_target} enqueue_for_user=#{has_enqueue}")
+      ::DigestEligibilityRules.warn("Plugin runtime state after patch: #{::DigestEligibilityRules.runtime_state_string}")
+    rescue => e
+      ::DigestEligibilityRules.warn("ERROR while patching Jobs::EnqueueDigestEmails: #{e.class}: #{e.message}\n#{e.backtrace&.first(15)&.join("\n")}")
+    end
   else
     ::DigestEligibilityRules.warn("ERROR: Jobs::EnqueueDigestEmails not found; plugin not applied")
   end
