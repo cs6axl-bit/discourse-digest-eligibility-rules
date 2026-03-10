@@ -18,11 +18,13 @@ plugins:
   digest_eligibility_rules_groups_json:
     default: "[]"
     type: text
+    textarea: true
     client: false
 
   digest_eligibility_rules_excludes_json:
     default: "[]"
     type: text
+    textarea: true
     client: false
 
   # emails_list sources (UNLIMITED)
@@ -33,6 +35,7 @@ plugins:
   digest_eligibility_emails_lists_json:
     default: "[]"
     type: text
+    textarea: true
     client: false
 
   # emails_list caching
@@ -68,7 +71,7 @@ plugins:
     type: enum
     choices:
       - now
-      - random_future    
+      - random_future
 
   # Shared cache key prefix (bump to hard-bust caches)
   digest_eligibility_emails_list_cache_prefix:
