@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-digest-eligibility-rules
 # about: Configurable eligibility + exclusion condition-groups (OR of AND rules) to decide who receives digest emails, incl. PG emails_list checks + optional L1/L2 caching.
-# version: 2.6.2
+# version: 2.7.0
 # authors: you
 # required_version: 3.0.0
 # v2.6.2:
@@ -894,6 +894,142 @@ after_initialize do
     end
 
     # --------------------------------
+    # SQL-query-based email lists
+    # --------------------------------
+
+    SQL_LIST_CACHE_PREFIX = "der:sql_list:v1"
+
+    # Basic safety check: query must look like a SELECT and must not contain
+    # obvious write statements. Not a full SQL parser — just a sanity guard.
+    def self.sql_list_query_safe?(query)
+      q = query.to_s.strip
+      return false if q.empty?
+      # Must start with SELECT (ignoring leading comments/whitespace)
+      normalized = q.gsub(/\A(\s|--[^\n]*\n|\/\*.*?\*\/)+/m, "").strip.upcase
+      return false unless normalized.start_with?("SELECT")
+      # Reject obvious write keywords at word boundaries
+      return false if normalized.match?(/\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE|EXECUTE|CALL)\b/)
+      true
+    rescue
+      false
+    end
+
+    def self.load_sql_lists_config
+      raw = SiteSetting.digest_eligibility_sql_lists_json.to_s.strip
+      return {} if raw.blank?
+
+      parsed = JSON.parse(raw)
+      return {} unless parsed.is_a?(Array)
+
+      out = {}
+      parsed.each do |row|
+        next unless row.is_a?(Hash)
+        name  = row["name"].to_s.strip
+        query = row["query"].to_s.strip
+        ttl   = row["ttl_seconds"].to_i
+
+        next if name.blank? || query.blank?
+        next unless valid_ident?(name)
+
+        unless sql_list_query_safe?(query)
+          warn("sql_list name=#{name} REJECTED: query failed safety check")
+          next
+        end
+
+        out[name] = { query: query, ttl_seconds: ttl }
+      end
+      out
+    rescue => e
+      warn("ERROR parsing digest_eligibility_sql_lists_json: #{e.class}: #{e.message}")
+      {}
+    end
+
+    def self.sql_list_cache_key(name, query)
+      digest = Digest::SHA1.hexdigest(query.to_s)[0, 16]
+      "#{SQL_LIST_CACHE_PREFIX}:#{name}:#{digest}"
+    end
+
+    def self.fetch_emails_from_sql_list(name, query, ttl_seconds)
+      ttl = ttl_seconds.to_i
+      ttl = emails_list_cache_ttl_seconds if ttl <= 0
+
+      cache_key = sql_list_cache_key(name, query)
+
+      if l2_enabled? && ttl > 0
+        begin
+          arr = Discourse.cache.fetch(cache_key, expires_in: ttl.seconds) do
+            debug("sql_list L2 MISS name=#{name} key=#{cache_key} => running query")
+            run_sql_list_query(name, query)
+          end
+          arr = [] unless arr.is_a?(Array)
+          arr = arr.map { |x| x.to_s.strip.downcase }.reject(&:blank?).uniq
+          debug("sql_list L2 HIT/MISS-RETURN name=#{name} rows=#{arr.length}")
+          return Set.new(arr)
+        rescue => e
+          debug("sql_list L2 fetch failed name=#{name}: #{e.class}: #{e.message}")
+        end
+      end
+
+      arr = run_sql_list_query(name, query)
+      Set.new(arr)
+    rescue => e
+      warn("fetch_emails_from_sql_list failed name=#{name}: #{e.class}: #{e.message}")
+      Set.new
+    end
+
+    def self.run_sql_list_query(name, query)
+      res = ::DB.query(query.to_s)
+
+      ary =
+        if res.is_a?(Array)
+          res
+        elsif res.respond_to?(:to_a)
+          tmp = res.to_a
+          tmp.is_a?(Array) ? tmp : []
+        else
+          []
+        end
+
+      out = []
+      ary.each do |r|
+        v =
+          if r.respond_to?(:[])
+            (r[:email] rescue nil) || (r["email"] rescue nil)
+          elsif r.respond_to?(:email)
+            (r.email rescue nil)
+          end
+        s = v.to_s.strip.downcase
+        out << s unless s.empty?
+      end
+
+      out.uniq!
+      debug("sql_list query name=#{name} returned rows=#{out.length}")
+      out
+    rescue => e
+      warn("sql_list query failed name=#{name}: #{e.class}: #{e.message}")
+      []
+    end
+
+    def self.precompute_sql_lists_by_name(referenced_names, sql_config)
+      out = {}
+      names = Array(referenced_names).map { |x| x.to_s.strip }.reject(&:blank?).uniq
+      return out if names.empty?
+
+      names.each do |name|
+        cfg = sql_config[name]
+        next unless cfg  # not a sql list, skip (may be a static list)
+
+        out[name] = fetch_emails_from_sql_list(name, cfg[:query], cfg[:ttl_seconds])
+        debug("sql_list loaded name=#{name} rows=#{out[name].length}")
+      end
+
+      out
+    rescue => e
+      warn("precompute_sql_lists_by_name failed: #{e.class}: #{e.message}")
+      {}
+    end
+
+    # --------------------------------
     # Main filter
     # --------------------------------
     def self.filter_ids_by_rules(base_user_ids)
@@ -934,8 +1070,13 @@ after_initialize do
           .tap { |arr| arr.concat(exclude_groups)  if apply_exc }
 
       emails_lists_config   = load_emails_lists_config
+      sql_lists_config      = load_sql_lists_config
       referenced_list_names = collect_emails_list_names(groups_for_ref)
+
+      # Static lists first, then merge sql lists (sql list wins on name collision)
       emails_lists_by_name  = precompute_emails_lists_by_name(referenced_list_names, emails_lists_config)
+      sql_lists_by_name     = precompute_sql_lists_by_name(referenced_list_names, sql_lists_config)
+      emails_lists_by_name.merge!(sql_lists_by_name)
 
       rc_merge_missing!(rc, find_missing_emails_list_refs_in_groups(groups_for_ref, emails_lists_by_name))
 
