@@ -77,3 +77,14 @@ plugins:
   digest_eligibility_emails_list_cache_prefix:
     default: "der:emails_list:v1"
     client: false
+
+  # SQL-query-based email lists (dynamic, per-list configurable TTL)
+  # Each entry: {"name":"my_list","query":"SELECT email FROM some_table WHERE ...","ttl_seconds":900}
+  # The query MUST return an `email` column. No bind parameters allowed.
+  # Names are referenced in group rules exactly like static emails_list names.
+  # ttl_seconds defaults to digest_eligibility_emails_list_cache_ttl_seconds when omitted or 0.
+  digest_eligibility_sql_lists_json:
+    default: "[]"
+    type: text
+    textarea: true
+    client: false
