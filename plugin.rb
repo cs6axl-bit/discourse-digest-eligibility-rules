@@ -1,9 +1,23 @@
 # frozen_string_literal: true
 # name: discourse-digest-eligibility-rules
 # about: Configurable eligibility + exclusion condition-groups (OR of AND rules) to decide who receives digest emails, incl. PG emails_list checks + optional L1/L2 caching.
-# version: 2.7.0
+# version: 2.8.0
 # authors: you
 # required_version: 3.0.0
+# v2.8.0:
+# - NEW: Custom base query mode (digest_eligibility_custom_query_mode).
+#   When enabled, the plugin replaces Discourse's built-in target_user_ids SQL
+#   with a user-supplied SELECT query. All existing include/exclude rule logic
+#   still runs on top of the returned IDs (unless apply_rules is off).
+# - NEW: digest_eligibility_custom_query_sql — the replacement query (must
+#   return a column named `user_id` or `id`).
+# - NEW: digest_eligibility_custom_query_failsafe — when enabled (default true),
+#   IDs from the custom query are joined back against Discourse's digest-eligibility
+#   conditions so users with digest disabled / suspended / not activated are never
+#   sent to the queue even if your query returns them.
+# - NEW: digest_eligibility_custom_query_apply_rules — when enabled (default true),
+#   the include/exclude rule groups still run on top of the custom query results.
+#   Disable to use the custom query output (after failsafe) without any further filtering.
 # v2.6.2:
 # - FIX: stop relying on enqueue_for_user for stats counting (it is not hit in this Discourse flow).
 # - Stats are now recorded from execute, based on the filtered target_user_ids captured during the run.
@@ -90,6 +104,112 @@ after_initialize do
       "random_future"
     rescue
       "random_future"
+    end
+
+    # --------------------------------
+    # Custom base query mode
+    # --------------------------------
+    def self.custom_query_mode?
+      SiteSetting.digest_eligibility_custom_query_mode
+    rescue
+      false
+    end
+
+    def self.custom_query_failsafe?
+      SiteSetting.digest_eligibility_custom_query_failsafe
+    rescue
+      true
+    end
+
+    def self.custom_query_apply_rules?
+      SiteSetting.digest_eligibility_custom_query_apply_rules
+    rescue
+      true
+    end
+
+    # Run the user-supplied SQL and return an array of integer user IDs.
+    # Accepts a column named `user_id` or `id` (first match wins per row).
+    def self.run_custom_base_query
+      sql = SiteSetting.digest_eligibility_custom_query_sql.to_s.strip
+
+      if sql.blank?
+        warn("custom_query: no SQL configured — returning empty set")
+        return []
+      end
+
+      unless sql_list_query_safe?(sql)
+        warn("custom_query REJECTED: query failed safety check (must be SELECT, no write statements)")
+        return []
+      end
+
+      res = ::DB.query(sql)
+
+      ary =
+        if res.is_a?(Array)
+          res
+        elsif res.respond_to?(:to_a)
+          tmp = res.to_a
+          tmp.is_a?(Array) ? tmp : []
+        else
+          []
+        end
+
+      out = []
+      ary.each do |r|
+        v =
+          if r.respond_to?(:[])
+            (r[:user_id] rescue nil) ||
+              (r[:id]      rescue nil) ||
+              (r["user_id"] rescue nil) ||
+              (r["id"]      rescue nil)
+          elsif r.respond_to?(:user_id)
+            (r.user_id rescue nil)
+          elsif r.respond_to?(:id)
+            (r.id rescue nil)
+          end
+
+        next if v.nil?
+        i = v.to_i
+        out << i if i > 0
+      end
+
+      result = out.uniq
+      warn("custom_query: returned #{result.length} user IDs")
+      result
+    rescue => e
+      warn("custom_query failed: #{e.class}: #{e.message}\n#{e.backtrace&.first(5)&.join("\n")}")
+      []
+    end
+
+    # Re-filter IDs through Discourse's standard digest-eligibility conditions.
+    # Guarantees users with digest disabled, suspended accounts, or zero-frequency
+    # settings are never queued even if the custom query returns them.
+    def self.apply_digest_failsafe_filter(user_ids)
+      return [] if user_ids.blank?
+
+      ids =
+        User
+          .real
+          .activated
+          .not_staged
+          .not_suspended
+          .joins(:user_option, :user_stat, :user_emails)
+          .where(id: user_ids)
+          .where("user_options.email_digests")
+          .where(
+            "COALESCE(user_options.digest_after_minutes, ?) > 0",
+            SiteSetting.default_email_digest_frequency,
+          )
+          .where("user_stats.bounce_score < ?", SiteSetting.bounce_score_threshold)
+          .where("user_emails.primary")
+          .pluck(:id)
+
+      debug("apply_digest_failsafe_filter: input=#{user_ids.length} passed=#{ids.length} removed=#{user_ids.length - ids.length}")
+      ids
+    rescue => e
+      warn("apply_digest_failsafe_filter failed: #{e.class}: #{e.message}")
+      # On error, fail safe: return empty so nothing unexpected is queued
+      []
     end
 
     # --------------------------------
@@ -904,10 +1024,8 @@ after_initialize do
     def self.sql_list_query_safe?(query)
       q = query.to_s.strip
       return false if q.empty?
-      # Must start with SELECT (ignoring leading comments/whitespace)
       normalized = q.gsub(/\A(\s|--[^\n]*\n|\/\*.*?\*\/)+/m, "").strip.upcase
       return false unless normalized.start_with?("SELECT")
-      # Reject obvious write keywords at word boundaries
       return false if normalized.match?(/\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE|EXECUTE|CALL)\b/)
       true
     rescue
@@ -1200,6 +1318,43 @@ after_initialize do
       def target_user_ids
         ::DigestEligibilityRules.warn("target_user_ids HIT class=#{self.class.name} #{::DigestEligibilityRules.runtime_state_string}")
 
+        if ::DigestEligibilityRules.enabled? && ::DigestEligibilityRules.custom_query_mode?
+          # ----------------------------------------------------------------
+          # CUSTOM QUERY MODE: bypass Discourse's built-in SQL entirely.
+          # ----------------------------------------------------------------
+          ::DigestEligibilityRules.warn("target_user_ids CUSTOM_QUERY_MODE active")
+
+          ids = ::DigestEligibilityRules.run_custom_base_query
+
+          begin
+            ::DigestEligibilityRules.warn("target_user_ids custom_query returned count=#{ids.length} sample=#{ids.first(10).inspect}")
+          rescue => e
+            ::DigestEligibilityRules.warn("target_user_ids custom_query log failed: #{e.class}: #{e.message}")
+          end
+
+          if ::DigestEligibilityRules.custom_query_failsafe?
+            before_failsafe = ids.length
+            ids = ::DigestEligibilityRules.apply_digest_failsafe_filter(ids)
+            ::DigestEligibilityRules.warn("target_user_ids failsafe applied before=#{before_failsafe} after=#{ids.length} removed=#{before_failsafe - ids.length}")
+          else
+            ::DigestEligibilityRules.warn("target_user_ids failsafe DISABLED — using raw custom query results")
+          end
+
+          if ::DigestEligibilityRules.custom_query_apply_rules?
+            out = ::DigestEligibilityRules.filter_ids_by_rules(ids)
+            ::DigestEligibilityRules.warn("target_user_ids CUSTOM_QUERY_MODE rules applied count=#{out.length} sample=#{out.first(10).inspect}")
+          else
+            out = ids
+            ::DigestEligibilityRules.warn("target_user_ids CUSTOM_QUERY_MODE rules SKIPPED count=#{out.length} sample=#{out.first(10).inspect}")
+          end
+
+          @digest_eligibility_filtered_ids = Array(out).map(&:to_i).uniq
+          return out
+        end
+
+        # ----------------------------------------------------------------
+        # DEFAULT MODE: call Discourse's original target_user_ids.
+        # ----------------------------------------------------------------
         ids = super
 
         begin

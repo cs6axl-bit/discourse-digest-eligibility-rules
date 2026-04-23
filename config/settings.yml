@@ -88,3 +88,43 @@ plugins:
     type: text
     textarea: true
     client: false
+
+  # ---------------------------------------------------------------------------
+  # Custom base query mode
+  # When enabled, the plugin replaces Discourse's default target_user_ids query
+  # with the SQL supplied below. All existing include/exclude rule logic still
+  # runs on top of whatever user IDs your query returns (unless
+  # digest_eligibility_custom_query_apply_rules is turned off).
+  # ---------------------------------------------------------------------------
+
+  # Master switch: replace Discourse's built-in candidate query with your own.
+  digest_eligibility_custom_query_mode:
+    default: false
+    client: false
+
+  # The SQL query that returns the candidate user IDs.
+  # Must be a SELECT. Must return a column named `user_id` or `id`.
+  # Additional columns are allowed and ignored.
+  # No bind parameters. No write statements.
+  # Example: SELECT id FROM users WHERE ...
+  digest_eligibility_custom_query_sql:
+    default: ""
+    type: text
+    textarea: true
+    client: false
+
+  # Failsafe: even if your query returns a user, skip them if digest emails are
+  # disabled for that account (email_digests=false or digest_after_minutes=0)
+  # or the account is suspended / not activated.
+  # Strongly recommended to keep this on.
+  digest_eligibility_custom_query_failsafe:
+    default: true
+    client: false
+
+  # Apply include/exclude rule groups (digest_eligibility_rules_groups_json /
+  # digest_eligibility_rules_excludes_json) on top of the custom query results.
+  # When off, the custom query output (after failsafe) is used as-is with no
+  # further include/exclude filtering.
+  digest_eligibility_custom_query_apply_rules:
+    default: true
+    client: false
