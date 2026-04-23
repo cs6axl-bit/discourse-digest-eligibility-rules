@@ -141,3 +141,15 @@ plugins:
   digest_eligibility_custom_query_recent_digest_hours:
     default: 23
     client: false
+
+  # Failsafe: remove users from the custom query results who were sent any email
+  # within the last N hours. Uses users.last_emailed_at — updated on every
+  # outbound email, not just digests.
+  digest_eligibility_custom_query_recent_emailed_failsafe:
+    default: false
+    client: false
+
+  # How many hours back to look when applying the recent-emailed failsafe above.
+  digest_eligibility_custom_query_recent_emailed_hours:
+    default: 23
+    client: false

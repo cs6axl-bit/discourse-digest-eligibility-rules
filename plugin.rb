@@ -147,6 +147,20 @@ after_initialize do
       23
     end
 
+    def self.custom_query_recent_emailed_failsafe?
+      SiteSetting.digest_eligibility_custom_query_recent_emailed_failsafe
+    rescue
+      false
+    end
+
+    def self.custom_query_recent_emailed_hours
+      v = SiteSetting.digest_eligibility_custom_query_recent_emailed_hours.to_i
+      v = 23 if v <= 0
+      v
+    rescue
+      23
+    end
+
     # Remove IDs that already have a digest_attempted_at within the last N hours.
     def self.apply_recent_digest_failsafe_filter(user_ids)
       return [] if user_ids.blank?
@@ -164,6 +178,26 @@ after_initialize do
       result
     rescue => e
       warn("apply_recent_digest_failsafe_filter failed: #{e.class}: #{e.message}")
+      []
+    end
+
+    # Remove IDs whose last_emailed_at is within the last N hours.
+    def self.apply_recent_emailed_failsafe_filter(user_ids)
+      return [] if user_ids.blank?
+
+      hours = custom_query_recent_emailed_hours
+      recently_mailed = User
+        .where(id: user_ids)
+        .where("last_emailed_at > CURRENT_TIMESTAMP - (:hours * INTERVAL '1 hour')", hours: hours)
+        .pluck(:id)
+
+      recently_mailed_set = recently_mailed.to_set
+      result = user_ids.reject { |id| recently_mailed_set.include?(id) }
+
+      warn("apply_recent_emailed_failsafe_filter: input=#{user_ids.length} removed=#{recently_mailed.length} (last_emailed_at within last #{hours}h) passed=#{result.length}")
+      result
+    rescue => e
+      warn("apply_recent_emailed_failsafe_filter failed: #{e.class}: #{e.message}")
       []
     end
 
@@ -1386,6 +1420,14 @@ after_initialize do
             ::DigestEligibilityRules.warn("target_user_ids recent_digest_failsafe applied hours=#{::DigestEligibilityRules.custom_query_recent_digest_hours} before=#{before_recent} after=#{ids.length} removed=#{before_recent - ids.length}")
           else
             ::DigestEligibilityRules.warn("target_user_ids recent_digest_failsafe DISABLED")
+          end
+
+          if ::DigestEligibilityRules.custom_query_recent_emailed_failsafe?
+            before_emailed = ids.length
+            ids = ::DigestEligibilityRules.apply_recent_emailed_failsafe_filter(ids)
+            ::DigestEligibilityRules.warn("target_user_ids recent_emailed_failsafe applied hours=#{::DigestEligibilityRules.custom_query_recent_emailed_hours} before=#{before_emailed} after=#{ids.length} removed=#{before_emailed - ids.length}")
+          else
+            ::DigestEligibilityRules.warn("target_user_ids recent_emailed_failsafe DISABLED")
           end
 
           if ::DigestEligibilityRules.custom_query_apply_rules?
