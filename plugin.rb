@@ -1,9 +1,15 @@
 # frozen_string_literal: true
 # name: discourse-digest-eligibility-rules
 # about: Configurable eligibility + exclusion condition-groups (OR of AND rules) to decide who receives digest emails, incl. PG emails_list checks + optional L1/L2 caching.
-# version: 2.8.0
+# version: 2.9.0
 # authors: you
 # required_version: 3.0.0
+# v2.9.0:
+# - NEW: digest_eligibility_custom_query_recent_digest_failsafe — removes users
+#   from custom query results who already have a digest_attempted_at within the
+#   last N hours, preventing double-sends within a configurable window.
+# - NEW: digest_eligibility_custom_query_recent_digest_hours — the lookback
+#   window in hours (default 23).
 # v2.8.0:
 # - NEW: Custom base query mode (digest_eligibility_custom_query_mode).
 #   When enabled, the plugin replaces Discourse's built-in target_user_ids SQL
@@ -125,6 +131,40 @@ after_initialize do
       SiteSetting.digest_eligibility_custom_query_apply_rules
     rescue
       true
+    end
+
+    def self.custom_query_recent_digest_failsafe?
+      SiteSetting.digest_eligibility_custom_query_recent_digest_failsafe
+    rescue
+      true
+    end
+
+    def self.custom_query_recent_digest_hours
+      v = SiteSetting.digest_eligibility_custom_query_recent_digest_hours.to_i
+      v = 23 if v <= 0
+      v
+    rescue
+      23
+    end
+
+    # Remove IDs that already have a digest_attempted_at within the last N hours.
+    def self.apply_recent_digest_failsafe_filter(user_ids)
+      return [] if user_ids.blank?
+
+      hours = custom_query_recent_digest_hours
+      recently_mailed = UserStat
+        .where(user_id: user_ids)
+        .where("digest_attempted_at > CURRENT_TIMESTAMP - (:hours * INTERVAL '1 hour')", hours: hours)
+        .pluck(:user_id)
+
+      recently_mailed_set = recently_mailed.to_set
+      result = user_ids.reject { |id| recently_mailed_set.include?(id) }
+
+      warn("apply_recent_digest_failsafe_filter: input=#{user_ids.length} removed=#{recently_mailed.length} (digest_attempted_at within last #{hours}h) passed=#{result.length}")
+      result
+    rescue => e
+      warn("apply_recent_digest_failsafe_filter failed: #{e.class}: #{e.message}")
+      []
     end
 
     # Run the user-supplied SQL and return an array of integer user IDs.
@@ -1338,6 +1378,14 @@ after_initialize do
             ::DigestEligibilityRules.warn("target_user_ids failsafe applied before=#{before_failsafe} after=#{ids.length} removed=#{before_failsafe - ids.length}")
           else
             ::DigestEligibilityRules.warn("target_user_ids failsafe DISABLED — using raw custom query results")
+          end
+
+          if ::DigestEligibilityRules.custom_query_recent_digest_failsafe?
+            before_recent = ids.length
+            ids = ::DigestEligibilityRules.apply_recent_digest_failsafe_filter(ids)
+            ::DigestEligibilityRules.warn("target_user_ids recent_digest_failsafe applied hours=#{::DigestEligibilityRules.custom_query_recent_digest_hours} before=#{before_recent} after=#{ids.length} removed=#{before_recent - ids.length}")
+          else
+            ::DigestEligibilityRules.warn("target_user_ids recent_digest_failsafe DISABLED")
           end
 
           if ::DigestEligibilityRules.custom_query_apply_rules?

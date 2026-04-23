@@ -128,3 +128,16 @@ plugins:
   digest_eligibility_custom_query_apply_rules:
     default: true
     client: false
+
+  # Failsafe: remove users from the custom query results who already received
+  # (or had a digest attempt recorded) within the last N hours.
+  # Uses user_stats.digest_attempted_at — the same column Discourse stamps on
+  # every digest send or skipped-user mark.
+  digest_eligibility_custom_query_recent_digest_failsafe:
+    default: true
+    client: false
+
+  # How many hours back to look when applying the recent-digest failsafe above.
+  digest_eligibility_custom_query_recent_digest_hours:
+    default: 23
+    client: false
