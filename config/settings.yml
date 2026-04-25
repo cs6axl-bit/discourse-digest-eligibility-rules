@@ -164,3 +164,11 @@ plugins:
   digest_eligibility_bypass_user_email_digest_checks:
     default: false
     client: false
+
+  # When enabled, logs one line per user showing the digest_attempted_at and
+  # last_seen_at values that were bypassed. Only active when
+  # digest_eligibility_bypass_user_email_digest_checks is also enabled.
+  # Turn off in production once you have confirmed the bypass is working.
+  digest_eligibility_bypass_user_email_digest_checks_log:
+    default: false
+    client: false
