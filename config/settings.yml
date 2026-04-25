@@ -153,3 +153,14 @@ plugins:
   digest_eligibility_custom_query_recent_emailed_hours:
     default: 23
     client: false
+
+  # When enabled, bypasses the two silent-skip checks inside Jobs::UserEmail
+  # for digest emails:
+  #   1. digest_attempted_at > delay.minutes.ago  → skipped
+  #   2. last_seen_at > delay.minutes.ago          → skipped
+  # Use this when your custom query already handles these conditions and you
+  # want all returned users to reach content generation.
+  # Has no effect when custom query mode is disabled.
+  digest_eligibility_bypass_user_email_digest_checks:
+    default: false
+    client: false
