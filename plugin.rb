@@ -1484,6 +1484,32 @@ after_initialize do
 
         result = super
 
+        begin
+          debug_ids = Array(@digest_eligibility_filtered_ids).map(&:to_i).uniq
+          if debug_ids.any?
+            recently_attempted = UserStat
+              .where(user_id: debug_ids)
+              .where("digest_attempted_at > ?", 30.days.ago)
+              .pluck(:user_id)
+            ::DigestEligibilityRules.warn("DEBUG digest_attempted_at_recent count=#{recently_attempted.length} sample=#{recently_attempted.first(5).inspect}")
+
+            recently_sent = EmailLog
+              .where(user_id: debug_ids, email_type: "digest")
+              .where("created_at > ?", 30.days.ago)
+              .distinct
+              .pluck(:user_id)
+            ::DigestEligibilityRules.warn("DEBUG emaillog_recent_digest count=#{recently_sent.length} sample=#{recently_sent.first(5).inspect}")
+
+            high_bounce = UserStat
+              .where(user_id: debug_ids)
+              .where("bounce_score >= ?", SiteSetting.bounce_score_threshold)
+              .pluck(:user_id)
+            ::DigestEligibilityRules.warn("DEBUG high_bounce_score count=#{high_bounce.length} sample=#{high_bounce.first(5).inspect}")
+          end
+        rescue => e
+          ::DigestEligibilityRules.warn("DEBUG block failed: #{e.class}: #{e.message}")
+        end
+
         unless ::DigestEligibilityRules.enabled?
           ::DigestEligibilityRules.warn("execute SKIP stats bump because plugin disabled")
           return result
