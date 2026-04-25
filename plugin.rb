@@ -161,6 +161,12 @@ after_initialize do
       23
     end
 
+    def self.bypass_user_email_digest_checks?
+      SiteSetting.digest_eligibility_bypass_user_email_digest_checks
+    rescue
+      false
+    end
+
     # Remove IDs that already have a digest_attempted_at within the last N hours.
     def self.apply_recent_digest_failsafe_filter(user_ids)
       return [] if user_ids.blank?
@@ -1581,5 +1587,51 @@ after_initialize do
     end
   else
     ::DigestEligibilityRules.warn("ERROR: Jobs::EnqueueDigestEmails not found; plugin not applied")
+  end
+
+  if defined?(::Jobs::UserEmail)
+    module ::DigestEligibilityRules
+      module UserEmailPatch
+        def message_for_email(user, post, type, notification, args = nil)
+          if type.to_s == "digest" &&
+              ::DigestEligibilityRules.enabled? &&
+              ::DigestEligibilityRules.custom_query_mode? &&
+              ::DigestEligibilityRules.bypass_user_email_digest_checks?
+
+            original_digest_attempted_at = user.user_stat&.digest_attempted_at
+            original_last_seen_at        = user.last_seen_at
+
+            ::DigestEligibilityRules.warn(
+              "UserEmailPatch BYPASS user_id=#{user.id} " \
+              "digest_attempted_at=#{original_digest_attempted_at.inspect} " \
+              "last_seen_at=#{original_last_seen_at.inspect}"
+            )
+
+            begin
+              user.user_stat.digest_attempted_at = nil if user.user_stat
+              user.last_seen_at = nil
+              super
+            ensure
+              user.user_stat.digest_attempted_at = original_digest_attempted_at if user.user_stat
+              user.last_seen_at = original_last_seen_at
+            end
+          else
+            super
+          end
+        rescue => e
+          ::DigestEligibilityRules.warn("UserEmailPatch ERROR user_id=#{user&.id} #{e.class}: #{e.message}")
+          raise
+        end
+      end
+    end
+
+    begin
+      ::Jobs::UserEmail.prepend(::DigestEligibilityRules::UserEmailPatch)
+      ::DigestEligibilityRules.warn("Patched Jobs::UserEmail with UserEmailPatch")
+    rescue => e
+      ::DigestEligibilityRules.warn("ERROR while patching Jobs::UserEmail: #{e.class}: #{e.message}")
+    end
+  else
+    ::DigestEligibilityRules.warn("WARNING: Jobs::UserEmail not found; UserEmailPatch not applied")
   end
 end
