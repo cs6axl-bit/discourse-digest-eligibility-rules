@@ -167,6 +167,12 @@ after_initialize do
       false
     end
 
+    def self.bypass_user_email_digest_checks_log?
+      SiteSetting.digest_eligibility_bypass_user_email_digest_checks_log
+    rescue
+      false
+    end
+
     # Remove IDs that already have a digest_attempted_at within the last N hours.
     def self.apply_recent_digest_failsafe_filter(user_ids)
       return [] if user_ids.blank?
@@ -1600,6 +1606,14 @@ after_initialize do
 
             original_digest_attempted_at = user.user_stat&.digest_attempted_at
             original_last_seen_at        = user.last_seen_at
+
+            if ::DigestEligibilityRules.bypass_user_email_digest_checks_log?
+              ::DigestEligibilityRules.warn(
+                "UserEmailPatch BYPASS user_id=#{user.id} " \
+                "digest_attempted_at=#{original_digest_attempted_at.inspect} " \
+                "last_seen_at=#{original_last_seen_at.inspect}"
+              )
+            end
 
             begin
               user.user_stat.digest_attempted_at = nil if user.user_stat
