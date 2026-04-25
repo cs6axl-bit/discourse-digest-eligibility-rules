@@ -1487,24 +1487,42 @@ after_initialize do
         begin
           debug_ids = Array(@digest_eligibility_filtered_ids).map(&:to_i).uniq
           if debug_ids.any?
-            recently_attempted = UserStat
-              .where(user_id: debug_ids)
-              .where("digest_attempted_at > ?", 30.days.ago)
-              .pluck(:user_id)
-            ::DigestEligibilityRules.warn("DEBUG digest_attempted_at_recent count=#{recently_attempted.length} sample=#{recently_attempted.first(5).inspect}")
+            default_delay = SiteSetting.default_email_digest_frequency.to_i
 
-            recently_sent = EmailLog
-              .where(user_id: debug_ids, email_type: "digest")
-              .where("created_at > ?", 30.days.ago)
-              .distinct
-              .pluck(:user_id)
-            ::DigestEligibilityRules.warn("DEBUG emaillog_recent_digest count=#{recently_sent.length} sample=#{recently_sent.first(5).inspect}")
+            # Mirror Jobs::UserEmail check 1:
+            # return if user.user_stat.digest_attempted_at > delay.minutes.ago
+            blocked_by_attempted = User
+              .joins(:user_stat, :user_option)
+              .where(id: debug_ids)
+              .where(
+                "user_stats.digest_attempted_at IS NOT NULL AND user_stats.digest_attempted_at > NOW() - (COALESCE(NULLIF(user_options.digest_after_minutes,0), ?) * INTERVAL '1 minute')",
+                default_delay
+              )
+              .pluck(:id)
+            ::DigestEligibilityRules.warn("DEBUG jobs_usemail_would_skip_digest_attempted_at count=#{blocked_by_attempted.length} sample=#{blocked_by_attempted.first(5).inspect}")
 
-            high_bounce = UserStat
+            # Mirror Jobs::UserEmail check 2:
+            # return if user.last_seen_at > delay.minutes.ago
+            blocked_by_seen = User
+              .joins(:user_option)
+              .where(id: debug_ids)
+              .where(
+                "users.last_seen_at IS NOT NULL AND users.last_seen_at > NOW() - (COALESCE(NULLIF(user_options.digest_after_minutes,0), ?) * INTERVAL '1 minute')",
+                default_delay
+              )
+              .pluck(:id)
+            ::DigestEligibilityRules.warn("DEBUG jobs_usemail_would_skip_last_seen_at count=#{blocked_by_seen.length} sample=#{blocked_by_seen.first(5).inspect}")
+
+            # Mirror Jobs::UserEmail check 3:
+            # return if user.user_stat.bounce_score >= bounce_score_threshold
+            blocked_by_bounce = UserStat
               .where(user_id: debug_ids)
               .where("bounce_score >= ?", SiteSetting.bounce_score_threshold)
               .pluck(:user_id)
-            ::DigestEligibilityRules.warn("DEBUG high_bounce_score count=#{high_bounce.length} sample=#{high_bounce.first(5).inspect}")
+            ::DigestEligibilityRules.warn("DEBUG jobs_usemail_would_skip_bounce_score count=#{blocked_by_bounce.length} sample=#{blocked_by_bounce.first(5).inspect}")
+
+            total_would_skip = (blocked_by_attempted | blocked_by_seen | blocked_by_bounce).length
+            ::DigestEligibilityRules.warn("DEBUG jobs_usemail_total_would_skip=#{total_would_skip} out of #{debug_ids.length} enqueued")
           end
         rescue => e
           ::DigestEligibilityRules.warn("DEBUG block failed: #{e.class}: #{e.message}")
