@@ -1601,12 +1601,6 @@ after_initialize do
             original_digest_attempted_at = user.user_stat&.digest_attempted_at
             original_last_seen_at        = user.last_seen_at
 
-            ::DigestEligibilityRules.warn(
-              "UserEmailPatch BYPASS user_id=#{user.id} " \
-              "digest_attempted_at=#{original_digest_attempted_at.inspect} " \
-              "last_seen_at=#{original_last_seen_at.inspect}"
-            )
-
             begin
               user.user_stat.digest_attempted_at = nil if user.user_stat
               user.last_seen_at = nil
